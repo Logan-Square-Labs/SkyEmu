@@ -26,4 +26,4 @@ else
 fi
 
 # Serve
-SERVE_DIR="$(pwd)" HOST="$HOST" PORT="$PORT" python3 "$(dirname "$0")/serve_auth.py"
+SERVE_DIR="$(pwd)" CERT_DIR="$(pwd)" HOST="$HOST" PORT="$PORT" python3 "$(dirname "$0")/serve_auth.py"

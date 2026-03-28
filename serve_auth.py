@@ -1,54 +1,60 @@
 #!/usr/bin/env python3
-"""Authenticated HTTPS static file server for SkyEmu web builds."""
+"""Authenticated HTTP static file server for SkyEmu web builds."""
 
 import http.server
-import ssl
+import http.cookies
 import os
 import secrets
-import subprocess
-import sys
-import tempfile
 from urllib.parse import urlparse, parse_qs
-
-
-def generate_self_signed_cert(cert_dir):
-    cert_file = os.path.join(cert_dir, "cert.pem")
-    key_file = os.path.join(cert_dir, "key.pem")
-    if not os.path.exists(cert_file) or not os.path.exists(key_file):
-        subprocess.run(
-            [
-                "openssl", "req", "-x509", "-newkey", "rsa:2048",
-                "-keyout", key_file, "-out", cert_file,
-                "-days", "365", "-nodes",
-                "-subj", "/CN=localhost",
-            ],
-            check=True,
-            capture_output=True,
-        )
-    return cert_file, key_file
 
 
 class TokenAuthHandler(http.server.SimpleHTTPRequestHandler):
     token = None
+    base_path = "/"
+    session_secret = secrets.token_urlsafe(32)
+
+    def _get_session_cookie(self):
+        cookie_header = self.headers.get("Cookie", "")
+        cookies = http.cookies.SimpleCookie(cookie_header)
+        morsel = cookies.get("session")
+        return morsel.value if morsel else None
+
+    def _set_session_cookie(self):
+        self.send_header("Set-Cookie", f"session={self.session_secret}; Path=/; HttpOnly; SameSite=Lax")
 
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         provided = params.get("token", [None])[0]
 
-        if provided != self.token:
+        # Strip base path prefix to map to filesystem
+        path = parsed.path
+        if not path.startswith(self.base_path):
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"404 Not Found")
+            return
+
+        # Remove prefix so file serving maps to the serve directory root
+        stripped = path[len(self.base_path):] or ""
+        file_path = "/" + stripped
+
+        if provided == self.token:
+            self.send_response(302)
+            self._set_session_cookie()
+            self.send_header("Location", self.base_path)
+            self.end_headers()
+        elif self._get_session_cookie() == self.session_secret:
+            self.path = file_path
+            super().do_GET()
+        else:
             self.send_response(403)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"403 Forbidden: invalid or missing token")
-            return
-
-        # Strip token from path so file serving works normally
-        self.path = parsed.path
-        super().do_GET()
 
     def log_message(self, format, *args):
-        # Suppress token from logs
         sanitized = [str(a).replace(self.token, "<token>") if self.token else str(a) for a in args]
         super().log_message(format, *sanitized)
 
@@ -57,27 +63,19 @@ def main():
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     token = os.environ.get("TOKEN", secrets.token_urlsafe(32))
+    base_path = os.environ.get("BASE_PATH", "/").rstrip("/") + "/"
     serve_dir = os.environ.get("SERVE_DIR", ".")
 
     os.chdir(serve_dir)
 
-    # Generate self-signed cert in a temp directory (or reuse from build dir)
-    cert_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build")
-    os.makedirs(cert_dir, exist_ok=True)
-    cert_file, key_file = generate_self_signed_cert(cert_dir)
-
     TokenAuthHandler.token = token
+    TokenAuthHandler.base_path = base_path
 
     server = http.server.HTTPServer((host, port), TokenAuthHandler)
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert_file, key_file)
-    server.socket = ctx.wrap_socket(server.socket, server_side=True)
-
-    url = f"https://{host}:{port}/?token={token}"
+    url = f"http://{host}:{port}{base_path}?token={token}"
     print(f"\nServing SkyEmu at:\n\n  {url}\n")
-    print("Share this URL. The token is required for access.")
-    print("(Your browser will warn about the self-signed certificate — this is expected.)\n")
+    print("Share this URL. The token is required for access.\n")
 
     try:
         server.serve_forever()

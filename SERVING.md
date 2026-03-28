@@ -2,13 +2,45 @@
 
 Build and serve SkyEmu locally so others can run it in their browser.
 
-## Prerequisites
+## Docker (recommended)
+
+Only requires Docker — no Emscripten or Python install needed.
+
+```bash
+# Build the image (compiles the WASM binary inside the container)
+docker build -t skyemu-web .
+
+# Run it
+docker run -p 8080:8080 skyemu-web
+
+# Custom port
+docker run -p 3000:8080 skyemu-web
+
+# Fixed token (default is random each run)
+docker run -p 8080:8080 -e TOKEN=mysecret skyemu-web
+```
+
+On startup, the container prints a URL with the access token:
+
+```
+Serving SkyEmu at:
+
+  https://0.0.0.0:8080/?token=<random-token>
+
+Share this URL. The token is required for access.
+```
+
+Replace `0.0.0.0` with your machine's IP when sharing (e.g., `https://192.168.1.42:8080/?token=...`).
+
+## Without Docker
+
+### Prerequisites
 
 - [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html) (`emcmake` on PATH)
 - Python 3
 - OpenSSL (for self-signed certificate generation)
 
-## Usage
+### Usage
 
 ```bash
 # Build and serve on https://0.0.0.0:8080
@@ -24,17 +56,7 @@ Build and serve SkyEmu locally so others can run it in their browser.
 TOKEN=mysecret ./serve.sh
 ```
 
-On startup, the server prints a URL with an embedded access token:
-
-```
-Serving SkyEmu at:
-
-  https://0.0.0.0:8080/?token=<random-token>
-
-Share this URL. The token is required for access.
-```
-
-## Options
+### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -49,9 +71,5 @@ Share this URL. The token is required for access.
 ## Security
 
 - **Token auth**: Every request must include `?token=<token>` in the URL. Requests without a valid token get a `403 Forbidden` response.
-- **HTTPS**: The server uses a self-signed TLS certificate (auto-generated in `build/`). Browsers will show a certificate warning on first visit — this is expected for self-signed certs.
+- **HTTPS**: The server uses a self-signed TLS certificate (auto-generated at startup). Browsers will show a certificate warning on first visit — this is expected for self-signed certs.
 - **Log safety**: Tokens are redacted from server logs.
-
-## Sharing
-
-Share the full URL (including the token) with anyone you want to grant access. The default host `0.0.0.0` makes the server accessible to other devices on your network — replace it with your machine's IP in the URL you share (e.g., `https://192.168.1.42:8080/?token=...`).
