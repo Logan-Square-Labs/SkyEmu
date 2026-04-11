@@ -46,6 +46,47 @@
           overflow: hidden;
           display: block;
       }
+      #recording-controls {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        z-index: 110;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-end;
+        font-family: sans-serif;
+      }
+      .recording-button {
+        min-width: 150px;
+        border-radius: 999px;
+        border: 2px solid transparent;
+        font-size: 14px;
+        font-weight: 700;
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+      .recording-button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      #start-recording {
+        background: #d41212;
+        color: #ffffff;
+      }
+      #stop-recording {
+        background: #000000;
+        color: #ff5252;
+        border-color: #c30000;
+      }
+      #recording-status {
+        color: #ffffff;
+        background: rgba(0, 0, 0, 0.65);
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        max-width: 220px;
+      }
       input[type="file"] {
         display: block !important;
         opacity: 0% !important;
@@ -99,6 +140,11 @@
     <div class="emscripten_border" id="container">
       <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex=-1></canvas>
     </div>
+    <div id="recording-controls">
+      <button class="recording-button" id="start-recording" type="button">Start Recording</button>
+      <button class="recording-button" id="stop-recording" type="button">Stop Recording</button>
+      <div id="recording-status">Recorder idle</div>
+    </div>
     <!-- Code for displaying console 
     <hr/>
     <textarea class="emscripten" id="output" rows="8"></textarea>
@@ -113,7 +159,348 @@
       var statusElement = document.getElementById('status');
       var progressElement = document.getElementById('progress');
       var spinnerElement = document.getElementById('spinner');
+      var startRecordingButton = document.getElementById('start-recording');
+      var stopRecordingButton = document.getElementById('stop-recording');
+      var recordingStatusElement = document.getElementById('recording-status');
       
+      function setRecordingStatus(text) {
+        recordingStatusElement.textContent = text;
+      }
+
+      function setRecordingButtonsState(isRecording, runtimeReady) {
+        startRecordingButton.disabled = !runtimeReady || isRecording;
+        stopRecordingButton.disabled = !runtimeReady || !isRecording;
+      }
+
+      var recorderRuntimeReady = false;
+      var isRecorderRunning = false;
+      var recordingSessionCounter = 0;
+
+      function triggerDownload(blob, filename) {
+        const a = document.createElement('a');
+        const url = window.URL.createObjectURL(blob);
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      }
+
+      function sanitizeRecordingName(name) {
+        const fallback = 'gameboy';
+        const trimmed = (name || '').trim();
+        if (!trimmed) return fallback;
+        const sanitized = trimmed.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '');
+        return sanitized || fallback;
+      }
+
+      function createSessionUuid() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+          return window.crypto.randomUUID();
+        }
+        recordingSessionCounter += 1;
+        return 'session-' + Date.now().toString(16) + '-' + recordingSessionCounter.toString(16);
+      }
+
+      function actionStateFromMask(actionMask) {
+        return {
+          a: actionMask & (1 << 0) ? 1 : 0,
+          b: actionMask & (1 << 1) ? 1 : 0,
+          up: actionMask & (1 << 2) ? 1 : 0,
+          down: actionMask & (1 << 3) ? 1 : 0,
+          left: actionMask & (1 << 4) ? 1 : 0,
+          right: actionMask & (1 << 5) ? 1 : 0,
+          start: actionMask & (1 << 6) ? 1 : 0,
+          select: actionMask & (1 << 7) ? 1 : 0
+        };
+      }
+
+      window.skyemuRecorder = {
+        recording: false,
+        rotating: false,
+        stopRequested: false,
+        canvas: null,
+        ctx: null,
+        imageData: null,
+        captureStream: null,
+        videoTrack: null,
+        mediaRecorder: null,
+        mediaOptions: {},
+        chunks: [],
+        actions: [],
+        pendingFrames: [],
+        pendingActions: [],
+        sessionUuid: '',
+        romBaseName: 'gameboy',
+        sessionStartMs: 0,
+        fps: 60,
+        partNumber: 0,
+        nextPartNumber: 0,
+        nextPartStartFrame: 0,
+        setRuntimeReady: function(ready) {
+          recorderRuntimeReady = !!ready;
+          setRecordingButtonsState(this.recording, recorderRuntimeReady);
+          if (!recorderRuntimeReady) {
+            setRecordingStatus('Recorder loading...');
+          }
+        },
+        getPartBaseName: function(partNumber) {
+          return this.romBaseName + '.' + this.sessionUuid + '.' + String(partNumber).padStart(4, '0');
+        },
+        appendSegmentMeta: function(startFrame) {
+          this.actions.push(JSON.stringify({
+            type: 'meta',
+            rom: this.romBaseName,
+            session_uuid: this.sessionUuid,
+            part_number: this.partNumber,
+            start_frame: startFrame,
+            fps: this.fps
+          }));
+        },
+        prepareSegmentBuffers: function(partNumber, startFrame) {
+          this.partNumber = partNumber;
+          this.chunks = [];
+          this.actions = [];
+          this.appendSegmentMeta(startFrame);
+        },
+        buildMediaOptions: function() {
+          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+            return { mimeType: 'video/webm;codecs=vp9' };
+          }
+          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+            return { mimeType: 'video/webm;codecs=vp8' };
+          }
+          if (MediaRecorder.isTypeSupported('video/webm')) {
+            return { mimeType: 'video/webm' };
+          }
+          return {};
+        },
+        startMediaRecorderForCurrentPart: function() {
+          try {
+            this.mediaRecorder = new MediaRecorder(this.captureStream, this.mediaOptions);
+          } catch (error) {
+            this.mediaRecorder = new MediaRecorder(this.captureStream);
+          }
+          this.mediaRecorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) this.chunks.push(event.data);
+          };
+          this.mediaRecorder.start();
+        },
+        start: function(width, height, fps, romName) {
+          if (this.recording) return true;
+          if (typeof MediaRecorder === 'undefined') {
+            setRecordingStatus('MediaRecorder is not supported in this browser.');
+            return false;
+          }
+          this.canvas = document.createElement('canvas');
+          this.canvas.width = width;
+          this.canvas.height = height;
+          this.ctx = this.canvas.getContext('2d', { alpha: false, willReadFrequently: false });
+          if (!this.ctx) {
+            setRecordingStatus('Unable to initialize recorder canvas.');
+            return false;
+          }
+          this.imageData = this.ctx.createImageData(width, height);
+          this.fps = fps || 60;
+          this.captureStream = this.canvas.captureStream(0);
+          this.videoTrack = this.captureStream.getVideoTracks()[0] || null;
+          if (!this.videoTrack || typeof this.videoTrack.requestFrame !== 'function') {
+            this.captureStream = this.canvas.captureStream(this.fps);
+            this.videoTrack = this.captureStream.getVideoTracks()[0] || null;
+          }
+          this.mediaOptions = this.buildMediaOptions();
+          this.pendingFrames = [];
+          this.pendingActions = [];
+          this.sessionUuid = createSessionUuid();
+          this.romBaseName = sanitizeRecordingName(romName);
+          this.sessionStartMs = performance.now();
+          this.rotating = false;
+          this.stopRequested = false;
+          this.nextPartNumber = 1;
+          this.nextPartStartFrame = 0;
+          this.prepareSegmentBuffers(0, 0);
+          this.startMediaRecorderForCurrentPart();
+
+          this.recording = true;
+          isRecorderRunning = true;
+          setRecordingButtonsState(true, recorderRuntimeReady);
+          setRecordingStatus('Recording Game Boy LCD part 0000...');
+          return true;
+        },
+        drawFrameToSegment: function(frameData) {
+          if (!this.ctx || !this.imageData) return;
+          this.imageData.data.set(frameData);
+          this.ctx.putImageData(this.imageData, 0, 0);
+          if (this.videoTrack && typeof this.videoTrack.requestFrame === 'function') {
+            this.videoTrack.requestFrame();
+          }
+        },
+        pushFrame: function(rgbaPtr, byteLen, frameIndex) {
+          if (!this.recording || !this.ctx || !this.imageData) return;
+          const frameData = new Uint8ClampedArray(HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen));
+          if (this.rotating) {
+            this.pendingFrames.push({ frameIndex: frameIndex, frameData: frameData });
+            return;
+          }
+          this.drawFrameToSegment(frameData);
+        },
+        logActionState: function(frameIndex, actionMask) {
+          if (!this.recording) return;
+          const line = JSON.stringify({
+            type: 'action_state',
+            frame_index: frameIndex,
+            action_state: actionStateFromMask(actionMask),
+            ts_ms: Math.round(performance.now() - this.sessionStartMs)
+          });
+          if (this.rotating) {
+            this.pendingActions.push(line);
+            return;
+          }
+          this.actions.push(line);
+        },
+        downloadCurrentPart: function() {
+          const partBaseName = this.getPartBaseName(this.partNumber);
+          const videoBlob = new Blob(this.chunks, { type: 'video/webm' });
+          triggerDownload(videoBlob, partBaseName + '.webm');
+
+          const jsonlText = this.actions.length ? (this.actions.join('\n') + '\n') : '';
+          const jsonlBlob = new Blob([jsonlText], { type: 'application/x-ndjson' });
+          triggerDownload(jsonlBlob, partBaseName + '.actions.jsonl');
+        },
+        finalizeSessionCleanup: function(message) {
+          this.recording = false;
+          this.rotating = false;
+          this.stopRequested = false;
+          isRecorderRunning = false;
+          this.mediaRecorder = null;
+          this.captureStream = null;
+          this.videoTrack = null;
+          this.ctx = null;
+          this.imageData = null;
+          this.canvas = null;
+          this.pendingFrames = [];
+          this.pendingActions = [];
+          setRecordingButtonsState(false, recorderRuntimeReady);
+          setRecordingStatus(message);
+        },
+        flushPendingToNewPart: function() {
+          while (this.pendingActions.length) {
+            this.actions.push(this.pendingActions.shift());
+          }
+          while (this.pendingFrames.length) {
+            const pendingFrame = this.pendingFrames.shift();
+            this.drawFrameToSegment(pendingFrame.frameData);
+          }
+        },
+        finishCurrentPart: function(onFinished) {
+          const finalize = () => {
+            this.downloadCurrentPart();
+            onFinished();
+          };
+          if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+            this.mediaRecorder.onstop = finalize;
+            this.mediaRecorder.stop();
+          } else {
+            finalize();
+          }
+        },
+        rotateSegment: function(partNumber, startFrame) {
+          if (!this.recording || this.stopRequested || this.rotating) return;
+          this.rotating = true;
+          this.nextPartNumber = partNumber;
+          this.nextPartStartFrame = startFrame;
+          setRecordingStatus('Saving segment ' + String(this.partNumber).padStart(4, '0') + '...');
+          this.finishCurrentPart(() => {
+            if (this.stopRequested) {
+              this.rotating = false;
+              if (this.pendingFrames.length || this.pendingActions.length) {
+                const finalPartNumber = this.nextPartNumber;
+                const finalStartFrame = this.nextPartStartFrame;
+                this.stopRequested = false;
+                this.prepareSegmentBuffers(finalPartNumber, finalStartFrame);
+                this.startMediaRecorderForCurrentPart();
+                this.flushPendingToNewPart();
+                setTimeout(() => {
+                  this.stopAndDownload();
+                }, 0);
+                return;
+              }
+              this.finalizeSessionCleanup('Recording saved locally.');
+              return;
+            }
+            this.prepareSegmentBuffers(this.nextPartNumber, this.nextPartStartFrame);
+            this.startMediaRecorderForCurrentPart();
+            this.flushPendingToNewPart();
+            this.rotating = false;
+            setRecordingButtonsState(true, recorderRuntimeReady);
+            setRecordingStatus('Recording Game Boy LCD part ' + String(this.partNumber).padStart(4, '0') + '...');
+          });
+        },
+        stopAndDownload: function() {
+          if (!this.recording) return;
+          if (this.rotating) {
+            this.stopRequested = true;
+            setRecordingStatus('Finalizing recording...');
+            return;
+          }
+          this.stopRequested = true;
+          setRecordingStatus('Saving recording...');
+          this.finishCurrentPart(() => {
+            if (this.pendingFrames.length || this.pendingActions.length) {
+              const finalPartNumber = this.nextPartNumber;
+              const finalStartFrame = this.nextPartStartFrame;
+              this.stopRequested = false;
+              this.prepareSegmentBuffers(finalPartNumber, finalStartFrame);
+              this.startMediaRecorderForCurrentPart();
+              this.flushPendingToNewPart();
+              setTimeout(() => {
+                this.stopAndDownload();
+              }, 0);
+              return;
+            }
+            this.finalizeSessionCleanup('Recording saved locally.');
+          });
+        }
+      };
+
+      function setRecordingEnabled(enabled) {
+        if (!recorderRuntimeReady) {
+          setRecordingStatus('Recorder not ready yet.');
+          return;
+        }
+        if (!Module) {
+          setRecordingStatus('Module not available.');
+          return;
+        }
+        let result = 0;
+        if (Module._se_set_gb_lcd_recording) {
+          result = Module._se_set_gb_lcd_recording(enabled ? 1 : 0);
+        } else if (Module.ccall) {
+          result = Module.ccall('se_set_gb_lcd_recording', 'number', ['number'], [enabled ? 1 : 0]);
+        } else {
+          setRecordingStatus('Recording bridge unavailable.');
+          return;
+        }
+
+        if (enabled && result === 0) {
+          setRecordingStatus('Load a Game Boy ROM before recording.');
+        } else if (!enabled && !isRecorderRunning) {
+          setRecordingButtonsState(false, recorderRuntimeReady);
+          setRecordingStatus('Recorder idle');
+        }
+      }
+
+      startRecordingButton.addEventListener('click', function() {
+        setRecordingEnabled(true);
+      });
+      stopRecordingButton.addEventListener('click', function() {
+        setRecordingEnabled(false);
+      });
+      setRecordingButtonsState(false, false);
+      setRecordingStatus('Recorder loading...');
+
       var Module = {
         preRun: [],
         postRun: [],
@@ -182,6 +569,12 @@
           Module.setStatus(left ? 'Preparing... (' + (this.totalDependencies-left) + '/' + this.totalDependencies + ')' : 'All downloads complete.');
         }
       };
+      Module.postRun.push(function() {
+        if (window.skyemuRecorder && window.skyemuRecorder.setRuntimeReady) {
+          window.skyemuRecorder.setRuntimeReady(true);
+          setRecordingStatus('Recorder idle');
+        }
+      });
 
       var container = document.getElementById ("container");
 

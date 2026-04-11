@@ -574,6 +574,19 @@ void se_png_write_mem(void *context, void *data, int size){
   memcpy(cont->data+cont->size,data,size);
   cont->size+=size; 
 }
+#define SE_GB_RECORD_SEGMENT_FRAMES 18000
+
+typedef struct{
+  bool active;
+  uint32_t frame_index;
+  uint32_t segment_frame_count;
+  uint32_t segment_index;
+  uint32_t segment_size_frames;
+  uint8_t prev_action_mask;
+  bool prev_action_mask_valid;
+}se_gb_recording_state_t;
+
+static se_gb_recording_state_t se_gb_recording_state = {0};
 static void se_sync_cloud_save_states();
 gui_state_t gui_state={ .update_font_atlas=true }; 
 
@@ -596,6 +609,7 @@ static void se_reset_core();
 static bool se_load_theme_from_file(const char * filename);
 static bool se_load_theme_from_memory(const uint8_t* data, int64_t size, bool invert, bool blacken);
 static bool se_reload_theme();
+static double se_get_sim_fps();
 
 double se_time();
 void se_push_disabled();
@@ -608,6 +622,124 @@ static int se_draw_theme_region_tint_partial(int region, float x, float y, float
 
 static void se_compute_draw_lcd_rect(float *lcd_render_w, float *lcd_render_h, int* nds_layout);
 static void se_draw_lcd_in_rect(float lcd_render_x, float lcd_render_y, float lcd_render_w, float lcd_render_h, int nds_layout);
+
+#if defined(EMSCRIPTEN)
+EM_JS(int, se_js_recorder_start, (int width, int height, double fps, const char* rom_name), {
+  if (window.skyemuRecorder && window.skyemuRecorder.start) {
+    return window.skyemuRecorder.start(width, height, fps, UTF8ToString(rom_name)) ? 1 : 0;
+  }
+  return 0;
+});
+
+EM_JS(void, se_js_recorder_push_frame, (const uint8_t* rgba_ptr, int byte_len, int frame_index), {
+  if (window.skyemuRecorder && window.skyemuRecorder.pushFrame) {
+    window.skyemuRecorder.pushFrame(rgba_ptr, byte_len, frame_index);
+  }
+});
+
+EM_JS(void, se_js_recorder_log_action_state, (int frame_index, int action_mask), {
+  if (window.skyemuRecorder && window.skyemuRecorder.logActionState) {
+    window.skyemuRecorder.logActionState(frame_index, action_mask);
+  }
+});
+
+EM_JS(void, se_js_recorder_stop_and_download, (), {
+  if (window.skyemuRecorder && window.skyemuRecorder.stopAndDownload) {
+    window.skyemuRecorder.stopAndDownload();
+  }
+});
+
+EM_JS(void, se_js_recorder_rotate_segment, (int part_index, int start_frame), {
+  if (window.skyemuRecorder && window.skyemuRecorder.rotateSegment) {
+    window.skyemuRecorder.rotateSegment(part_index, start_frame);
+  }
+});
+#endif
+
+static const int se_gb_record_action_keys[] = {
+  SE_KEY_A,
+  SE_KEY_B,
+  SE_KEY_UP,
+  SE_KEY_DOWN,
+  SE_KEY_LEFT,
+  SE_KEY_RIGHT,
+  SE_KEY_START,
+  SE_KEY_SELECT
+};
+
+static uint8_t se_gb_record_get_action_mask(void){
+  uint8_t action_mask = 0;
+  for(size_t i=0;i<sizeof(se_gb_record_action_keys)/sizeof(se_gb_record_action_keys[0]);++i){
+    int key = se_gb_record_action_keys[i];
+    if(emu_state.joy.inputs[key] > 0.5f){
+      action_mask |= (uint8_t)(1u<<i);
+    }
+  }
+  return action_mask;
+}
+
+static void se_gb_record_log_action_state(uint32_t frame_index){
+#if defined(EMSCRIPTEN)
+  uint8_t action_mask = se_gb_record_get_action_mask();
+  if(!se_gb_recording_state.prev_action_mask_valid || action_mask != se_gb_recording_state.prev_action_mask){
+    se_js_recorder_log_action_state((int)frame_index, (int)action_mask);
+  }
+  se_gb_recording_state.prev_action_mask = action_mask;
+  se_gb_recording_state.prev_action_mask_valid = true;
+#else
+  (void)frame_index;
+#endif
+}
+
+static const char* se_gb_record_get_rom_name(void){
+  const char *base = NULL;
+  const char *file = NULL;
+  const char *ext = NULL;
+  if(emu_state.rom_path[0] != '\0'){
+    sb_breakup_path(emu_state.rom_path, &base, &file, &ext);
+  }
+  (void)base;
+  (void)ext;
+  if(file && file[0] != '\0'){
+    return file;
+  }
+  return "gameboy";
+}
+
+#if defined(EMSCRIPTEN)
+EMSCRIPTEN_KEEPALIVE int se_set_gb_lcd_recording(int enabled){
+  if(enabled){
+    if(emu_state.system != SYSTEM_GB){
+      return 0;
+    }
+    if(se_gb_recording_state.active){
+      return 1;
+    }
+    se_gb_recording_state.prev_action_mask = 0;
+    se_gb_recording_state.prev_action_mask_valid = false;
+    se_gb_recording_state.frame_index = 0;
+    se_gb_recording_state.segment_frame_count = 0;
+    se_gb_recording_state.segment_index = 0;
+    se_gb_recording_state.segment_size_frames = SE_GB_RECORD_SEGMENT_FRAMES;
+    if(se_gb_recording_state.segment_size_frames == 0){
+      se_gb_recording_state.segment_size_frames = 1;
+    }
+    se_gb_recording_state.active = true;
+    if(!se_js_recorder_start(SB_LCD_W, SB_LCD_H, se_get_sim_fps(), se_gb_record_get_rom_name())){
+      se_gb_recording_state.active = false;
+      return 0;
+    }
+    return 1;
+  }
+  if(!se_gb_recording_state.active){
+    return 1;
+  }
+  se_gb_recording_state.active = false;
+  se_gb_recording_state.prev_action_mask_valid = false;
+  se_js_recorder_stop_and_download();
+  return 1;
+}
+#endif
 
 const char* se_get_pref_path(){
 #if defined(EMSCRIPTEN)
@@ -2707,7 +2839,9 @@ se_lcd_info_t se_get_lcd_info(){
   };
 }
 static void se_emulate_single_frame(){
+  bool should_capture_gb_frame = false;
   if(emu_state.system == SYSTEM_GB){
+    should_capture_gb_frame = emu_state.render_frame;
     if(gui_state.test_runner_mode){
       uint8_t palette[4*3] = { 0xff,0xff,0xff,0xAA,0xAA,0xAA,0x55,0x55,0x55,0x00,0x00,0x00 };
       for(int i=0;i<12;++i)core.gb.dmg_palette[i]=palette[i];
@@ -2720,6 +2854,19 @@ static void se_emulate_single_frame(){
       }
     }
     sb_tick(&emu_state,&core.gb, &scratch.gb);
+#if defined(EMSCRIPTEN)
+    if(se_gb_recording_state.active && should_capture_gb_frame){
+      se_gb_record_log_action_state(se_gb_recording_state.frame_index);
+      se_js_recorder_push_frame(core.gb.lcd.framebuffer, SB_LCD_W*SB_LCD_H*4, (int)se_gb_recording_state.frame_index);
+      se_gb_recording_state.frame_index++;
+      se_gb_recording_state.segment_frame_count++;
+      if(se_gb_recording_state.segment_frame_count >= se_gb_recording_state.segment_size_frames){
+        se_gb_recording_state.segment_frame_count = 0;
+        se_gb_recording_state.segment_index++;
+        se_js_recorder_rotate_segment((int)se_gb_recording_state.segment_index, (int)se_gb_recording_state.frame_index);
+      }
+    }
+#endif
   }
   else if(emu_state.system == SYSTEM_GBA)gba_tick(&emu_state, &core.gba, &scratch.gba);
   else if(emu_state.system == SYSTEM_NDS)nds_tick(&emu_state, &core.nds, &scratch.nds);
@@ -5324,6 +5471,11 @@ static void se_poll_sdl(){
 #endif
 
 void se_update_frame() {
+#if defined(EMSCRIPTEN)
+  if(se_gb_recording_state.active && emu_state.system != SYSTEM_GB){
+    se_set_gb_lcd_recording(0);
+  }
+#endif
   #ifdef ENABLE_HTTP_CONTROL_SERVER
   hcs_update(gui_state.settings.http_control_server_enable,gui_state.settings.http_control_server_port,se_hcs_callback);
   if(gui_state.settings.http_control_server_enable){
