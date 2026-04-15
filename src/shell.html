@@ -150,6 +150,7 @@
     <textarea class="emscripten" id="output" rows="8"></textarea>
     <hr>
     -->       
+    <script src="webm-muxer.js"></script>
     <script type='text/javascript'>    
       if ('serviceWorker' in navigator) {
           navigator.serviceWorker.register('sw.js').then(worker => {
@@ -221,14 +222,14 @@
         recording: false,
         rotating: false,
         stopRequested: false,
-        canvas: null,
-        ctx: null,
-        imageData: null,
-        captureStream: null,
-        videoTrack: null,
-        mediaRecorder: null,
-        mediaOptions: {},
-        chunks: [],
+        width: 0,
+        height: 0,
+        encoder: null,
+        encoderConfigTemplate: null,
+        muxerCodec: '',
+        muxer: null,
+        muxerTarget: null,
+        encoderProbePromise: null,
         actions: [],
         pendingFrames: [],
         pendingActions: [],
@@ -239,12 +240,116 @@
         partNumber: 0,
         nextPartNumber: 0,
         nextPartStartFrame: 0,
+        partStartFrame: 0,
+        segmentSubmittedFrameCount: 0,
+        keyFrameInterval: 300,
         setRuntimeReady: function(ready) {
-          recorderRuntimeReady = !!ready;
-          setRecordingButtonsState(this.recording, recorderRuntimeReady);
-          if (!recorderRuntimeReady) {
+          if (!ready) {
+            recorderRuntimeReady = false;
+            setRecordingButtonsState(this.recording, false);
             setRecordingStatus('Recorder loading...');
+            return;
           }
+          if (this.encoderProbePromise) return;
+
+          recorderRuntimeReady = false;
+          setRecordingButtonsState(this.recording, false);
+          setRecordingStatus('Checking recorder support...');
+          this.encoderProbePromise = this.probeEncoderSupport().then((result) => {
+            this.encoderConfigTemplate = result.config;
+            this.muxerCodec = result.muxerCodec;
+            recorderRuntimeReady = true;
+            setRecordingButtonsState(this.recording, true);
+            if (!this.recording) {
+              setRecordingStatus('Recorder idle');
+            }
+          }).catch((error) => {
+            console.error('Recorder capability probe failed.', error);
+            this.encoderConfigTemplate = null;
+            this.muxerCodec = '';
+            recorderRuntimeReady = false;
+            setRecordingButtonsState(this.recording, false);
+            setRecordingStatus(error && error.message ? error.message : 'Recorder unavailable in this browser.');
+          });
+        },
+        getProbeCandidates: function(width, height, fps) {
+          return [
+            {
+              config: {
+                codec: 'vp8',
+                width: width,
+                height: height,
+                bitrate: 1250000,
+                bitrateMode: 'constant',
+                framerate: fps,
+                latencyMode: 'realtime'
+              },
+              muxerCodec: 'V_VP8'
+            },
+            {
+              config: {
+                codec: 'vp09.00.10.08',
+                width: width,
+                height: height,
+                bitrate: 1500000,
+                bitrateMode: 'constant',
+                framerate: fps,
+                latencyMode: 'realtime'
+              },
+              muxerCodec: 'V_VP9'
+            }
+          ];
+        },
+        probeEncoderSupport: async function() {
+          if (typeof WebMMuxer === 'undefined') {
+            throw new Error('Recorder muxer failed to load.');
+          }
+          if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
+            throw new Error('WebCodecs video recording is not supported in this browser.');
+          }
+
+          const candidates = this.getProbeCandidates(160, 144, 60);
+          for (let i = 0; i < candidates.length; i += 1) {
+            const candidate = candidates[i];
+            try {
+              if (typeof VideoEncoder.isConfigSupported === 'function') {
+                const support = await VideoEncoder.isConfigSupported(candidate.config);
+                if (support && support.supported) {
+                  return candidate;
+                }
+                continue;
+              }
+
+              const probeEncoder = new VideoEncoder({
+                output: function() {},
+                error: function() {}
+              });
+              probeEncoder.configure(candidate.config);
+              probeEncoder.close();
+              return candidate;
+            } catch (error) {
+              continue;
+            }
+          }
+
+          throw new Error('No supported WebCodecs WebM video codec was found.');
+        },
+        forceDisableCoreRecorder: function() {
+          if (!Module) return;
+          try {
+            if (Module._se_set_gb_lcd_recording) {
+              Module._se_set_gb_lcd_recording(0);
+            } else if (Module.ccall) {
+              Module.ccall('se_set_gb_lcd_recording', 'number', ['number'], [0]);
+            }
+          } catch (error) {
+            console.error('Failed to disable recorder bridge after a fatal recorder error.', error);
+          }
+        },
+        abortRecordingWithError: function(message, error) {
+          console.error(message, error);
+          this.finalizeSessionCleanup(message);
+          this.forceDisableCoreRecorder();
         },
         getPartBaseName: function(partNumber) {
           return this.romBaseName + '.' + this.sessionUuid + '.' + String(partNumber).padStart(4, '0');
@@ -261,56 +366,62 @@
         },
         prepareSegmentBuffers: function(partNumber, startFrame) {
           this.partNumber = partNumber;
-          this.chunks = [];
+          this.partStartFrame = startFrame;
+          this.segmentSubmittedFrameCount = 0;
           this.actions = [];
           this.appendSegmentMeta(startFrame);
         },
-        buildMediaOptions: function() {
-          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-            return { mimeType: 'video/webm;codecs=vp9' };
+        buildEncoderConfig: function() {
+          if (!this.encoderConfigTemplate) {
+            throw new Error('Recorder codec support was not initialized.');
           }
-          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
-            return { mimeType: 'video/webm;codecs=vp8' };
-          }
-          if (MediaRecorder.isTypeSupported('video/webm')) {
-            return { mimeType: 'video/webm' };
-          }
-          return {};
-        },
-        startMediaRecorderForCurrentPart: function() {
-          try {
-            this.mediaRecorder = new MediaRecorder(this.captureStream, this.mediaOptions);
-          } catch (error) {
-            this.mediaRecorder = new MediaRecorder(this.captureStream);
-          }
-          this.mediaRecorder.ondataavailable = (event) => {
-            if (event.data && event.data.size > 0) this.chunks.push(event.data);
+          return {
+            codec: this.encoderConfigTemplate.codec,
+            width: this.width,
+            height: this.height,
+            bitrate: this.encoderConfigTemplate.bitrate,
+            bitrateMode: this.encoderConfigTemplate.bitrateMode,
+            framerate: this.fps,
+            latencyMode: this.encoderConfigTemplate.latencyMode
           };
-          this.mediaRecorder.start();
+        },
+        createMuxerForCurrentPart: function() {
+          this.muxerTarget = new WebMMuxer.ArrayBufferTarget();
+          this.muxer = new WebMMuxer.Muxer({
+            target: this.muxerTarget,
+            video: {
+              codec: this.muxerCodec,
+              width: this.width,
+              height: this.height,
+              frameRate: this.fps
+            }
+          });
+        },
+        startEncoderForCurrentPart: function() {
+          this.createMuxerForCurrentPart();
+          this.encoder = new VideoEncoder({
+            output: (chunk, meta) => {
+              this.muxer.addVideoChunk(chunk, meta);
+            },
+            error: (error) => {
+              setTimeout(() => {
+                this.abortRecordingWithError('Recording failed while encoding video.', error);
+              }, 0);
+            }
+          });
+          this.encoder.configure(this.buildEncoderConfig());
         },
         start: function(width, height, fps, romName) {
           if (this.recording) return true;
-          if (typeof MediaRecorder === 'undefined') {
-            setRecordingStatus('MediaRecorder is not supported in this browser.');
+          if (!this.encoderConfigTemplate || !this.muxerCodec) {
+            setRecordingStatus('Recorder support check has not completed or failed.');
             return false;
           }
-          this.canvas = document.createElement('canvas');
-          this.canvas.width = width;
-          this.canvas.height = height;
-          this.ctx = this.canvas.getContext('2d', { alpha: false, willReadFrequently: false });
-          if (!this.ctx) {
-            setRecordingStatus('Unable to initialize recorder canvas.');
-            return false;
-          }
-          this.imageData = this.ctx.createImageData(width, height);
+
+          this.width = width;
+          this.height = height;
           this.fps = fps || 60;
-          this.captureStream = this.canvas.captureStream(0);
-          this.videoTrack = this.captureStream.getVideoTracks()[0] || null;
-          if (!this.videoTrack || typeof this.videoTrack.requestFrame !== 'function') {
-            this.captureStream = this.canvas.captureStream(this.fps);
-            this.videoTrack = this.captureStream.getVideoTracks()[0] || null;
-          }
-          this.mediaOptions = this.buildMediaOptions();
+          this.keyFrameInterval = Math.max(1, Math.round(this.fps * 5));
           this.pendingFrames = [];
           this.pendingActions = [];
           this.sessionUuid = createSessionUuid();
@@ -321,7 +432,14 @@
           this.nextPartNumber = 1;
           this.nextPartStartFrame = 0;
           this.prepareSegmentBuffers(0, 0);
-          this.startMediaRecorderForCurrentPart();
+
+          try {
+            this.startEncoderForCurrentPart();
+          } catch (error) {
+            console.error('Failed to initialize the WebCodecs recorder.', error);
+            this.finalizeSessionCleanup(error && error.message ? error.message : 'Failed to initialize recorder.');
+            return false;
+          }
 
           this.recording = true;
           isRecorderRunning = true;
@@ -329,22 +447,54 @@
           setRecordingStatus('Recording Game Boy LCD part 0000...');
           return true;
         },
-        drawFrameToSegment: function(frameData) {
-          if (!this.ctx || !this.imageData) return;
-          this.imageData.data.set(frameData);
-          this.ctx.putImageData(this.imageData, 0, 0);
-          if (this.videoTrack && typeof this.videoTrack.requestFrame === 'function') {
-            this.videoTrack.requestFrame();
+        getRelativeFrameIndex: function(frameIndex) {
+          return frameIndex - this.partStartFrame;
+        },
+        getFrameTimestampUs: function(relativeFrameIndex) {
+          return Math.round(relativeFrameIndex * 1000000 / this.fps);
+        },
+        getFrameDurationUs: function(relativeFrameIndex) {
+          return Math.round((relativeFrameIndex + 1) * 1000000 / this.fps) - Math.round(relativeFrameIndex * 1000000 / this.fps);
+        },
+        submitFrameToEncoder: function(frameData, frameIndex) {
+          if (!this.encoder || !this.muxer) return;
+
+          const relativeFrameIndex = this.getRelativeFrameIndex(frameIndex);
+          if (relativeFrameIndex < 0) {
+            throw new Error('Recorder received a frame that predates the current segment start.');
+          }
+
+          const frame = new VideoFrame(frameData, {
+            format: 'RGBA',
+            codedWidth: this.width,
+            codedHeight: this.height,
+            timestamp: this.getFrameTimestampUs(relativeFrameIndex),
+            duration: this.getFrameDurationUs(relativeFrameIndex)
+          });
+
+          try {
+            this.encoder.encode(frame, {
+              keyFrame: relativeFrameIndex === 0 || (relativeFrameIndex % this.keyFrameInterval) === 0
+            });
+            this.segmentSubmittedFrameCount += 1;
+          } finally {
+            frame.close();
           }
         },
         pushFrame: function(rgbaPtr, byteLen, frameIndex) {
-          if (!this.recording || !this.ctx || !this.imageData) return;
-          const frameData = new Uint8ClampedArray(HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen));
+          if (!this.recording || !this.encoder) return;
+
+          const frameData = HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen);
           if (this.rotating) {
             this.pendingFrames.push({ frameIndex: frameIndex, frameData: frameData });
             return;
           }
-          this.drawFrameToSegment(frameData);
+
+          try {
+            this.submitFrameToEncoder(frameData, frameIndex);
+          } catch (error) {
+            this.abortRecordingWithError('Recording failed while submitting a frame.', error);
+          }
         },
         logActionState: function(frameIndex, actionMask) {
           if (!this.recording) return;
@@ -360,26 +510,62 @@
           }
           this.actions.push(line);
         },
-        downloadCurrentPart: function() {
+        buildCurrentPartData: function(videoBuffer) {
           const partBaseName = this.getPartBaseName(this.partNumber);
-          const videoBlob = new Blob(this.chunks, { type: 'video/webm' });
-          triggerDownload(videoBlob, partBaseName + '.webm');
-
+          const videoBlob = new Blob([videoBuffer], { type: 'video/webm' });
           const jsonlText = this.actions.length ? (this.actions.join('\n') + '\n') : '';
           const jsonlBlob = new Blob([jsonlText], { type: 'application/x-ndjson' });
-          triggerDownload(jsonlBlob, partBaseName + '.actions.jsonl');
+          return {
+            videoBlob: videoBlob,
+            jsonlBlob: jsonlBlob,
+            videoFilename: partBaseName + '.webm',
+            actionsFilename: partBaseName + '.actions.jsonl'
+          };
+        },
+        downloadCurrentPart: function(partData) {
+          triggerDownload(partData.videoBlob, partData.videoFilename);
+          triggerDownload(partData.jsonlBlob, partData.actionsFilename);
+        },
+        closeCurrentEncoder: function() {
+          if (this.encoder) {
+            try {
+              if (this.encoder.state !== 'closed') {
+                this.encoder.close();
+              }
+            } catch (error) {
+              console.error('Failed to close the active recorder encoder cleanly.', error);
+            }
+          }
+          this.encoder = null;
+        },
+        finalizeCurrentPartData: async function() {
+          const currentEncoder = this.encoder;
+          const currentMuxer = this.muxer;
+          const currentMuxerTarget = this.muxerTarget;
+          if (!currentEncoder || !currentMuxer || !currentMuxerTarget) {
+            throw new Error('Recorder state is incomplete for segment finalization.');
+          }
+
+          await currentEncoder.flush();
+          currentMuxer.finalize();
+          currentEncoder.close();
+          this.encoder = null;
+          this.muxer = null;
+          this.muxerTarget = null;
+
+          if (!currentMuxerTarget.buffer) {
+            throw new Error('Recorder muxer did not produce a segment buffer.');
+          }
+          return this.buildCurrentPartData(currentMuxerTarget.buffer);
         },
         finalizeSessionCleanup: function(message) {
           this.recording = false;
           this.rotating = false;
           this.stopRequested = false;
           isRecorderRunning = false;
-          this.mediaRecorder = null;
-          this.captureStream = null;
-          this.videoTrack = null;
-          this.ctx = null;
-          this.imageData = null;
-          this.canvas = null;
+          this.closeCurrentEncoder();
+          this.muxer = null;
+          this.muxerTarget = null;
           this.pendingFrames = [];
           this.pendingActions = [];
           setRecordingButtonsState(false, recorderRuntimeReady);
@@ -391,20 +577,12 @@
           }
           while (this.pendingFrames.length) {
             const pendingFrame = this.pendingFrames.shift();
-            this.drawFrameToSegment(pendingFrame.frameData);
+            this.submitFrameToEncoder(pendingFrame.frameData, pendingFrame.frameIndex);
           }
         },
-        finishCurrentPart: function(onFinished) {
-          const finalize = () => {
-            this.downloadCurrentPart();
-            onFinished();
-          };
-          if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-            this.mediaRecorder.onstop = finalize;
-            this.mediaRecorder.stop();
-          } else {
-            finalize();
-          }
+        finishCurrentPart: async function() {
+          const partData = await this.finalizeCurrentPartData();
+          this.downloadCurrentPart(partData);
         },
         rotateSegment: function(partNumber, startFrame) {
           if (!this.recording || this.stopRequested || this.rotating) return;
@@ -412,7 +590,7 @@
           this.nextPartNumber = partNumber;
           this.nextPartStartFrame = startFrame;
           setRecordingStatus('Saving segment ' + String(this.partNumber).padStart(4, '0') + '...');
-          this.finishCurrentPart(() => {
+          this.finishCurrentPart().then(() => {
             if (this.stopRequested) {
               this.rotating = false;
               if (this.pendingFrames.length || this.pendingActions.length) {
@@ -420,7 +598,7 @@
                 const finalStartFrame = this.nextPartStartFrame;
                 this.stopRequested = false;
                 this.prepareSegmentBuffers(finalPartNumber, finalStartFrame);
-                this.startMediaRecorderForCurrentPart();
+                this.startEncoderForCurrentPart();
                 this.flushPendingToNewPart();
                 setTimeout(() => {
                   this.stopAndDownload();
@@ -430,12 +608,15 @@
               this.finalizeSessionCleanup('Recording saved locally.');
               return;
             }
+
             this.prepareSegmentBuffers(this.nextPartNumber, this.nextPartStartFrame);
-            this.startMediaRecorderForCurrentPart();
+            this.startEncoderForCurrentPart();
             this.flushPendingToNewPart();
             this.rotating = false;
             setRecordingButtonsState(true, recorderRuntimeReady);
             setRecordingStatus('Recording Game Boy LCD part ' + String(this.partNumber).padStart(4, '0') + '...');
+          }).catch((error) => {
+            this.abortRecordingWithError('Recording failed while finalizing a segment.', error);
           });
         },
         stopAndDownload: function() {
@@ -445,15 +626,16 @@
             setRecordingStatus('Finalizing recording...');
             return;
           }
+
           this.stopRequested = true;
           setRecordingStatus('Saving recording...');
-          this.finishCurrentPart(() => {
+          this.finishCurrentPart().then(() => {
             if (this.pendingFrames.length || this.pendingActions.length) {
               const finalPartNumber = this.nextPartNumber;
               const finalStartFrame = this.nextPartStartFrame;
               this.stopRequested = false;
               this.prepareSegmentBuffers(finalPartNumber, finalStartFrame);
-              this.startMediaRecorderForCurrentPart();
+              this.startEncoderForCurrentPart();
               this.flushPendingToNewPart();
               setTimeout(() => {
                 this.stopAndDownload();
@@ -461,6 +643,8 @@
               return;
             }
             this.finalizeSessionCleanup('Recording saved locally.');
+          }).catch((error) => {
+            this.abortRecordingWithError('Recording failed while finalizing the session.', error);
           });
         }
       };
@@ -572,7 +756,6 @@
       Module.postRun.push(function() {
         if (window.skyemuRecorder && window.skyemuRecorder.setRuntimeReady) {
           window.skyemuRecorder.setRuntimeReady(true);
-          setRecordingStatus('Recorder idle');
         }
       });
 
