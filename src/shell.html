@@ -189,6 +189,11 @@
         document.body.removeChild(a);
       }
 
+      function getUploadEndpointUrl() {
+        const baseUrl = new URL('.', window.location.href);
+        return new URL('upload-recording', baseUrl).toString();
+      }
+
       function sanitizeRecordingName(name) {
         const fallback = 'gameboy';
         const trimmed = (name || '').trim();
@@ -227,8 +232,7 @@
         encoder: null,
         encoderConfigTemplate: null,
         muxerCodec: '',
-        muxer: null,
-        muxerTarget: null,
+        currentSegment: null,
         encoderProbePromise: null,
         actions: [],
         pendingFrames: [],
@@ -354,22 +358,34 @@
         getPartBaseName: function(partNumber) {
           return this.romBaseName + '.' + this.sessionUuid + '.' + String(partNumber).padStart(4, '0');
         },
-        appendSegmentMeta: function(startFrame) {
-          this.actions.push(JSON.stringify({
+        appendSegmentMeta: function(segment) {
+          segment.actions.push(JSON.stringify({
             type: 'meta',
             rom: this.romBaseName,
             session_uuid: this.sessionUuid,
-            part_number: this.partNumber,
-            start_frame: startFrame,
+            part_number: segment.partNumber,
+            start_frame: segment.startFrame,
             fps: this.fps
           }));
         },
         prepareSegmentBuffers: function(partNumber, startFrame) {
+          const segment = {
+            partNumber: partNumber,
+            startFrame: startFrame,
+            actions: [],
+            segmentSubmittedFrameCount: 0,
+            firstEncodedChunkTimestamp: null,
+            muxer: null,
+            muxerTarget: null,
+            encoder: null,
+            outputState: null
+          };
+          this.currentSegment = segment;
           this.partNumber = partNumber;
           this.partStartFrame = startFrame;
           this.segmentSubmittedFrameCount = 0;
-          this.actions = [];
-          this.appendSegmentMeta(startFrame);
+          this.actions = segment.actions;
+          this.appendSegmentMeta(segment);
         },
         buildEncoderConfig: function() {
           if (!this.encoderConfigTemplate) {
@@ -386,9 +402,14 @@
           };
         },
         createMuxerForCurrentPart: function() {
-          this.muxerTarget = new WebMMuxer.ArrayBufferTarget();
-          this.muxer = new WebMMuxer.Muxer({
-            target: this.muxerTarget,
+          const segment = this.currentSegment;
+          if (!segment) {
+            throw new Error('Recorder segment state was not initialized.');
+          }
+          segment.muxerTarget = new WebMMuxer.ArrayBufferTarget();
+          segment.muxer = new WebMMuxer.Muxer({
+            target: segment.muxerTarget,
+            firstTimestampBehavior: 'offset',
             video: {
               codec: this.muxerCodec,
               width: this.width,
@@ -399,17 +420,30 @@
         },
         startEncoderForCurrentPart: function() {
           this.createMuxerForCurrentPart();
-          this.encoder = new VideoEncoder({
+          const segment = this.currentSegment;
+          if (!segment || !segment.muxer) {
+            throw new Error('Recorder segment muxer was not created.');
+          }
+          const localMuxer = segment.muxer;
+          const outputState = { acceptingOutput: true };
+          segment.outputState = outputState;
+          segment.encoder = new VideoEncoder({
             output: (chunk, meta) => {
-              this.muxer.addVideoChunk(chunk, meta);
+              if (!outputState.acceptingOutput) return;
+              if (segment.firstEncodedChunkTimestamp === null) {
+                segment.firstEncodedChunkTimestamp = chunk.timestamp;
+              }
+              localMuxer.addVideoChunk(chunk, meta, chunk.timestamp - segment.firstEncodedChunkTimestamp);
             },
             error: (error) => {
+              if (!outputState.acceptingOutput) return;
               setTimeout(() => {
                 this.abortRecordingWithError('Recording failed while encoding video.', error);
               }, 0);
             }
           });
-          this.encoder.configure(this.buildEncoderConfig());
+          segment.encoder.configure(this.buildEncoderConfig());
+          this.encoder = segment.encoder;
         },
         start: function(width, height, fps, romName) {
           if (this.recording) return true;
@@ -447,8 +481,8 @@
           setRecordingStatus('Recording Game Boy LCD part 0000...');
           return true;
         },
-        getRelativeFrameIndex: function(frameIndex) {
-          return frameIndex - this.partStartFrame;
+        getRelativeFrameIndex: function(frameIndex, segment) {
+          return frameIndex - segment.startFrame;
         },
         getFrameTimestampUs: function(relativeFrameIndex) {
           return Math.round(relativeFrameIndex * 1000000 / this.fps);
@@ -457,9 +491,10 @@
           return Math.round((relativeFrameIndex + 1) * 1000000 / this.fps) - Math.round(relativeFrameIndex * 1000000 / this.fps);
         },
         submitFrameToEncoder: function(frameData, frameIndex) {
-          if (!this.encoder || !this.muxer) return;
+          const segment = this.currentSegment;
+          if (!segment || !segment.encoder || !segment.muxer) return;
 
-          const relativeFrameIndex = this.getRelativeFrameIndex(frameIndex);
+          const relativeFrameIndex = this.getRelativeFrameIndex(frameIndex, segment);
           if (relativeFrameIndex < 0) {
             throw new Error('Recorder received a frame that predates the current segment start.');
           }
@@ -473,16 +508,17 @@
           });
 
           try {
-            this.encoder.encode(frame, {
+            segment.encoder.encode(frame, {
               keyFrame: relativeFrameIndex === 0 || (relativeFrameIndex % this.keyFrameInterval) === 0
             });
-            this.segmentSubmittedFrameCount += 1;
+            segment.segmentSubmittedFrameCount += 1;
+            this.segmentSubmittedFrameCount = segment.segmentSubmittedFrameCount;
           } finally {
             frame.close();
           }
         },
         pushFrame: function(rgbaPtr, byteLen, frameIndex) {
-          if (!this.recording || !this.encoder) return;
+          if (!this.recording || !this.currentSegment || !this.currentSegment.encoder) return;
 
           const frameData = HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen);
           if (this.rotating) {
@@ -497,7 +533,7 @@
           }
         },
         logActionState: function(frameIndex, actionMask) {
-          if (!this.recording) return;
+          if (!this.recording || !this.currentSegment) return;
           const line = JSON.stringify({
             type: 'action_state',
             frame_index: frameIndex,
@@ -508,12 +544,12 @@
             this.pendingActions.push(line);
             return;
           }
-          this.actions.push(line);
+          this.currentSegment.actions.push(line);
         },
-        buildCurrentPartData: function(videoBuffer) {
-          const partBaseName = this.getPartBaseName(this.partNumber);
+        buildCurrentPartData: function(segment, videoBuffer) {
+          const partBaseName = this.getPartBaseName(segment.partNumber);
           const videoBlob = new Blob([videoBuffer], { type: 'video/webm' });
-          const jsonlText = this.actions.length ? (this.actions.join('\n') + '\n') : '';
+          const jsonlText = segment.actions.length ? (segment.actions.join('\n') + '\n') : '';
           const jsonlBlob = new Blob([jsonlText], { type: 'application/x-ndjson' });
           return {
             videoBlob: videoBlob,
@@ -522,41 +558,93 @@
             actionsFilename: partBaseName + '.actions.jsonl'
           };
         },
+        uploadCurrentPart: async function(segment, partData) {
+          const formData = new FormData();
+          formData.append('rom', this.romBaseName);
+          formData.append('session_uuid', this.sessionUuid);
+          formData.append('part_number', String(segment.partNumber));
+          formData.append('start_frame', String(segment.startFrame));
+          formData.append('fps', String(this.fps));
+          formData.append('video', partData.videoBlob, partData.videoFilename);
+          formData.append('actions', partData.jsonlBlob, partData.actionsFilename);
+
+          const response = await fetch(getUploadEndpointUrl(), {
+            method: 'POST',
+            credentials: 'same-origin',
+            body: formData
+          });
+
+          if (!response.ok) {
+            let bodyText = '';
+            try {
+              bodyText = await response.text();
+            } catch (error) {
+              bodyText = '';
+            }
+            throw new Error('Upload failed with status ' + response.status + (bodyText ? (': ' + bodyText) : ''));
+          }
+        },
         downloadCurrentPart: function(partData) {
           triggerDownload(partData.videoBlob, partData.videoFilename);
           triggerDownload(partData.jsonlBlob, partData.actionsFilename);
         },
+        persistCurrentPart: async function(segment, partData) {
+          try {
+            await this.uploadCurrentPart(segment, partData);
+            return { uploaded: true, fallbackDownload: false };
+          } catch (error) {
+            console.error('Segment upload failed; falling back to local download.', error);
+            this.downloadCurrentPart(partData);
+            setRecordingStatus('Upload failed for part ' + String(segment.partNumber).padStart(4, '0') + '; downloaded locally as fallback.');
+            return { uploaded: false, fallbackDownload: true };
+          }
+        },
         closeCurrentEncoder: function() {
-          if (this.encoder) {
+          const segment = this.currentSegment;
+          if (!segment) {
+            this.encoder = null;
+            return;
+          }
+          if (segment.outputState) {
+            segment.outputState.acceptingOutput = false;
+          }
+          if (segment.encoder) {
             try {
-              if (this.encoder.state !== 'closed') {
-                this.encoder.close();
+              if (segment.encoder.state !== 'closed') {
+                segment.encoder.close();
               }
             } catch (error) {
               console.error('Failed to close the active recorder encoder cleanly.', error);
             }
           }
+          segment.encoder = null;
+          segment.outputState = null;
           this.encoder = null;
         },
         finalizeCurrentPartData: async function() {
-          const currentEncoder = this.encoder;
-          const currentMuxer = this.muxer;
-          const currentMuxerTarget = this.muxerTarget;
-          if (!currentEncoder || !currentMuxer || !currentMuxerTarget) {
+          const segment = this.currentSegment;
+          if (!segment || !segment.encoder || !segment.muxer || !segment.muxerTarget) {
             throw new Error('Recorder state is incomplete for segment finalization.');
           }
-
-          await currentEncoder.flush();
-          currentMuxer.finalize();
-          currentEncoder.close();
+          this.currentSegment = null;
           this.encoder = null;
-          this.muxer = null;
-          this.muxerTarget = null;
 
-          if (!currentMuxerTarget.buffer) {
+          await segment.encoder.flush();
+          segment.muxer.finalize();
+          if (segment.outputState) {
+            segment.outputState.acceptingOutput = false;
+          }
+          segment.encoder.close();
+          segment.encoder = null;
+          segment.muxer = null;
+          segment.outputState = null;
+
+          if (!segment.muxerTarget.buffer) {
             throw new Error('Recorder muxer did not produce a segment buffer.');
           }
-          return this.buildCurrentPartData(currentMuxerTarget.buffer);
+          const partData = this.buildCurrentPartData(segment, segment.muxerTarget.buffer);
+          segment.muxerTarget = null;
+          return { segment: segment, partData: partData };
         },
         finalizeSessionCleanup: function(message) {
           this.recording = false;
@@ -564,16 +652,18 @@
           this.stopRequested = false;
           isRecorderRunning = false;
           this.closeCurrentEncoder();
-          this.muxer = null;
-          this.muxerTarget = null;
+          this.currentSegment = null;
+          this.actions = [];
           this.pendingFrames = [];
           this.pendingActions = [];
           setRecordingButtonsState(false, recorderRuntimeReady);
           setRecordingStatus(message);
         },
         flushPendingToNewPart: function() {
+          const segment = this.currentSegment;
+          if (!segment) return;
           while (this.pendingActions.length) {
-            this.actions.push(this.pendingActions.shift());
+            segment.actions.push(this.pendingActions.shift());
           }
           while (this.pendingFrames.length) {
             const pendingFrame = this.pendingFrames.shift();
@@ -581,16 +671,16 @@
           }
         },
         finishCurrentPart: async function() {
-          const partData = await this.finalizeCurrentPartData();
-          this.downloadCurrentPart(partData);
+          const finalized = await this.finalizeCurrentPartData();
+          return this.persistCurrentPart(finalized.segment, finalized.partData);
         },
         rotateSegment: function(partNumber, startFrame) {
           if (!this.recording || this.stopRequested || this.rotating) return;
           this.rotating = true;
           this.nextPartNumber = partNumber;
           this.nextPartStartFrame = startFrame;
-          setRecordingStatus('Saving segment ' + String(this.partNumber).padStart(4, '0') + '...');
-          this.finishCurrentPart().then(() => {
+          setRecordingStatus('Uploading segment ' + String(this.partNumber).padStart(4, '0') + '...');
+          this.finishCurrentPart().then((result) => {
             if (this.stopRequested) {
               this.rotating = false;
               if (this.pendingFrames.length || this.pendingActions.length) {
@@ -605,7 +695,7 @@
                 }, 0);
                 return;
               }
-              this.finalizeSessionCleanup('Recording saved locally.');
+              this.finalizeSessionCleanup(result && result.fallbackDownload ? 'Recording saved locally (upload fallback).' : 'Recording uploaded.');
               return;
             }
 
@@ -628,8 +718,8 @@
           }
 
           this.stopRequested = true;
-          setRecordingStatus('Saving recording...');
-          this.finishCurrentPart().then(() => {
+          setRecordingStatus('Uploading recording...');
+          this.finishCurrentPart().then((result) => {
             if (this.pendingFrames.length || this.pendingActions.length) {
               const finalPartNumber = this.nextPartNumber;
               const finalStartFrame = this.nextPartStartFrame;
@@ -642,7 +732,7 @@
               }, 0);
               return;
             }
-            this.finalizeSessionCleanup('Recording saved locally.');
+            this.finalizeSessionCleanup(result && result.fallbackDownload ? 'Recording saved locally (upload fallback).' : 'Recording uploaded.');
           }).catch((error) => {
             this.abortRecordingWithError('Recording failed while finalizing the session.', error);
           });

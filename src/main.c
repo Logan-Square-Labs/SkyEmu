@@ -574,7 +574,7 @@ void se_png_write_mem(void *context, void *data, int size){
   memcpy(cont->data+cont->size,data,size);
   cont->size+=size; 
 }
-#define SE_GB_RECORD_SEGMENT_FRAMES 18000
+#define SE_GB_RECORD_SEGMENT_FRAMES 1024//18000
 
 typedef struct{
   bool active;
