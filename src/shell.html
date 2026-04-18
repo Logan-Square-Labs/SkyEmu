@@ -210,567 +210,111 @@
         return 'session-' + Date.now().toString(16) + '-' + recordingSessionCounter.toString(16);
       }
 
-      function actionStateFromMask(actionMask) {
-        return {
-          a: actionMask & (1 << 0) ? 1 : 0,
-          b: actionMask & (1 << 1) ? 1 : 0,
-          up: actionMask & (1 << 2) ? 1 : 0,
-          down: actionMask & (1 << 3) ? 1 : 0,
-          left: actionMask & (1 << 4) ? 1 : 0,
-          right: actionMask & (1 << 5) ? 1 : 0,
-          start: actionMask & (1 << 6) ? 1 : 0,
-          select: actionMask & (1 << 7) ? 1 : 0
-        };
-      }
-
       window.skyemuRecorder = {
         recording: false,
-        rotating: false,
-        stopRequested: false,
-        width: 0,
-        height: 0,
-        encoder: null,
-        encoderConfigTemplate: null,
-        muxerCodec: '',
-        currentSegment: null,
-        encoderProbePromise: null,
-        actions: [],
-        pendingFrames: [],
-        pendingActions: [],
-        sessionUuid: '',
+        worker: null,
         romBaseName: 'gameboy',
-        sessionStartMs: 0,
-        fps: 60,
-        partNumber: 0,
-        nextPartNumber: 0,
-        nextPartStartFrame: 0,
-        partStartFrame: 0,
-        segmentSubmittedFrameCount: 0,
-        keyFrameInterval: 300,
+
+        setRomName: function(name) {
+          this.romBaseName = sanitizeRecordingName(name);
+        },
+
         setRuntimeReady: function(ready) {
-          if (!ready) {
-            recorderRuntimeReady = false;
-            setRecordingButtonsState(this.recording, false);
+          setRecordingButtonsState(this.recording, !!ready);
+          if (ready && !this.recording) {
+            setRecordingStatus('Recorder idle');
+          } else if (!ready) {
             setRecordingStatus('Recorder loading...');
+          }
+        },
+
+        start: function() {
+          if (this.recording || this.worker) return;
+          try {
+            this.worker = new Worker('recorder-worker.js');
+          } catch (error) {
+            setRecordingStatus('Failed to start recorder worker: ' + (error && error.message || error));
+            this.worker = null;
             return;
           }
-          if (this.encoderProbePromise) return;
-
-          recorderRuntimeReady = false;
-          setRecordingButtonsState(this.recording, false);
-          setRecordingStatus('Checking recorder support...');
-          this.encoderProbePromise = this.probeEncoderSupport().then((result) => {
-            this.encoderConfigTemplate = result.config;
-            this.muxerCodec = result.muxerCodec;
-            recorderRuntimeReady = true;
-            setRecordingButtonsState(this.recording, true);
-            if (!this.recording) {
-              setRecordingStatus('Recorder idle');
-            }
-          }).catch((error) => {
-            console.error('Recorder capability probe failed.', error);
-            this.encoderConfigTemplate = null;
-            this.muxerCodec = '';
-            recorderRuntimeReady = false;
-            setRecordingButtonsState(this.recording, false);
-            setRecordingStatus(error && error.message ? error.message : 'Recorder unavailable in this browser.');
+          this.worker.onmessage = (e) => this.onWorkerMessage(e.data);
+          this.worker.onerror   = (e) => this.onWorkerError(e);
+          this.worker.postMessage({
+            romName:     this.romBaseName,
+            sessionUuid: createSessionUuid(),
+            width:       160,
+            height:      144,
+            fps:         60,
+            uploadUrl:   getUploadEndpointUrl(),
           });
+          setRecordingStatus('Starting recorder...');
+          setRecordingButtonsState(false, false);
         },
-        getProbeCandidates: function(width, height, fps) {
-          return [
-            {
-              config: {
-                codec: 'vp8',
-                width: width,
-                height: height,
-                bitrate: 1250000,
-                bitrateMode: 'constant',
-                framerate: fps,
-                latencyMode: 'realtime'
-              },
-              muxerCodec: 'V_VP8'
-            },
-            {
-              config: {
-                codec: 'vp09.00.10.08',
-                width: width,
-                height: height,
-                bitrate: 1500000,
-                bitrateMode: 'constant',
-                framerate: fps,
-                latencyMode: 'realtime'
-              },
-              muxerCodec: 'V_VP9'
-            }
-          ];
-        },
-        probeEncoderSupport: async function() {
-          if (typeof WebMMuxer === 'undefined') {
-            throw new Error('Recorder muxer failed to load.');
-          }
-          if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
-            throw new Error('WebCodecs video recording is not supported in this browser.');
-          }
 
-          const candidates = this.getProbeCandidates(160, 144, 60);
-          for (let i = 0; i < candidates.length; i += 1) {
-            const candidate = candidates[i];
-            try {
-              if (typeof VideoEncoder.isConfigSupported === 'function') {
-                const support = await VideoEncoder.isConfigSupported(candidate.config);
-                if (support && support.supported) {
-                  return candidate;
-                }
-                continue;
-              }
-
-              const probeEncoder = new VideoEncoder({
-                output: function() {},
-                error: function() {}
-              });
-              probeEncoder.configure(candidate.config);
-              probeEncoder.close();
-              return candidate;
-            } catch (error) {
-              continue;
-            }
-          }
-
-          throw new Error('No supported WebCodecs WebM video codec was found.');
-        },
-        forceDisableCoreRecorder: function() {
-          if (!Module) return;
-          try {
-            if (Module._se_set_gb_lcd_recording) {
-              Module._se_set_gb_lcd_recording(0);
-            } else if (Module.ccall) {
-              Module.ccall('se_set_gb_lcd_recording', 'number', ['number'], [0]);
-            }
-          } catch (error) {
-            console.error('Failed to disable recorder bridge after a fatal recorder error.', error);
-          }
-        },
-        abortRecordingWithError: function(message, error) {
-          console.error(message, error);
-          this.finalizeSessionCleanup(message);
-          this.forceDisableCoreRecorder();
-        },
-        getPartBaseName: function(partNumber) {
-          return this.romBaseName + '.' + this.sessionUuid + '.' + String(partNumber).padStart(4, '0');
-        },
-        appendSegmentMeta: function(segment) {
-          segment.actions.push(JSON.stringify({
-            type: 'meta',
-            rom: this.romBaseName,
-            session_uuid: this.sessionUuid,
-            part_number: segment.partNumber,
-            start_frame: segment.startFrame,
-            fps: this.fps
-          }));
-        },
-        prepareSegmentBuffers: function(partNumber, startFrame) {
-          const segment = {
-            partNumber: partNumber,
-            startFrame: startFrame,
-            actions: [],
-            segmentSubmittedFrameCount: 0,
-            firstEncodedChunkTimestamp: null,
-            muxer: null,
-            muxerTarget: null,
-            encoder: null,
-            outputState: null
-          };
-          this.currentSegment = segment;
-          this.partNumber = partNumber;
-          this.partStartFrame = startFrame;
-          this.segmentSubmittedFrameCount = 0;
-          this.actions = segment.actions;
-          this.appendSegmentMeta(segment);
-        },
-        buildEncoderConfig: function() {
-          if (!this.encoderConfigTemplate) {
-            throw new Error('Recorder codec support was not initialized.');
-          }
-          return {
-            codec: this.encoderConfigTemplate.codec,
-            width: this.width,
-            height: this.height,
-            bitrate: this.encoderConfigTemplate.bitrate,
-            bitrateMode: this.encoderConfigTemplate.bitrateMode,
-            framerate: this.fps,
-            latencyMode: this.encoderConfigTemplate.latencyMode
-          };
-        },
-        createMuxerForCurrentPart: function() {
-          const segment = this.currentSegment;
-          if (!segment) {
-            throw new Error('Recorder segment state was not initialized.');
-          }
-          segment.muxerTarget = new WebMMuxer.ArrayBufferTarget();
-          segment.muxer = new WebMMuxer.Muxer({
-            target: segment.muxerTarget,
-            firstTimestampBehavior: 'offset',
-            video: {
-              codec: this.muxerCodec,
-              width: this.width,
-              height: this.height,
-              frameRate: this.fps
-            }
-          });
-        },
-        startEncoderForCurrentPart: function() {
-          this.createMuxerForCurrentPart();
-          const segment = this.currentSegment;
-          if (!segment || !segment.muxer) {
-            throw new Error('Recorder segment muxer was not created.');
-          }
-          const localMuxer = segment.muxer;
-          const outputState = { acceptingOutput: true };
-          segment.outputState = outputState;
-          segment.encoder = new VideoEncoder({
-            output: (chunk, meta) => {
-              if (!outputState.acceptingOutput) return;
-              if (segment.firstEncodedChunkTimestamp === null) {
-                segment.firstEncodedChunkTimestamp = chunk.timestamp;
-              }
-              localMuxer.addVideoChunk(chunk, meta, chunk.timestamp - segment.firstEncodedChunkTimestamp);
-            },
-            error: (error) => {
-              if (!outputState.acceptingOutput) return;
-              setTimeout(() => {
-                this.abortRecordingWithError('Recording failed while encoding video.', error);
-              }, 0);
-            }
-          });
-          segment.encoder.configure(this.buildEncoderConfig());
-          this.encoder = segment.encoder;
-        },
-        start: function(width, height, fps, romName) {
-          if (this.recording) return true;
-          if (!this.encoderConfigTemplate || !this.muxerCodec) {
-            setRecordingStatus('Recorder support check has not completed or failed.');
-            return false;
-          }
-
-          this.width = width;
-          this.height = height;
-          this.fps = fps || 60;
-          this.keyFrameInterval = Math.max(1, Math.round(this.fps * 5));
-          this.pendingFrames = [];
-          this.pendingActions = [];
-          this.sessionUuid = createSessionUuid();
-          this.romBaseName = sanitizeRecordingName(romName);
-          this.sessionStartMs = performance.now();
-          this.rotating = false;
-          this.stopRequested = false;
-          this.nextPartNumber = 1;
-          this.nextPartStartFrame = 0;
-          this.prepareSegmentBuffers(0, 0);
-
-          try {
-            this.startEncoderForCurrentPart();
-          } catch (error) {
-            console.error('Failed to initialize the WebCodecs recorder.', error);
-            this.finalizeSessionCleanup(error && error.message ? error.message : 'Failed to initialize recorder.');
-            return false;
-          }
-
-          this.recording = true;
-          isRecorderRunning = true;
-          setRecordingButtonsState(true, recorderRuntimeReady);
-          setRecordingStatus('Recording Game Boy LCD part 0000...');
-          return true;
-        },
-        getRelativeFrameIndex: function(frameIndex, segment) {
-          return frameIndex - segment.startFrame;
-        },
-        getFrameTimestampUs: function(relativeFrameIndex) {
-          return Math.round(relativeFrameIndex * 1000000 / this.fps);
-        },
-        getFrameDurationUs: function(relativeFrameIndex) {
-          return Math.round((relativeFrameIndex + 1) * 1000000 / this.fps) - Math.round(relativeFrameIndex * 1000000 / this.fps);
-        },
-        submitFrameToEncoder: function(frameData, frameIndex) {
-          const segment = this.currentSegment;
-          if (!segment || !segment.encoder || !segment.muxer) return;
-
-          const relativeFrameIndex = this.getRelativeFrameIndex(frameIndex, segment);
-          if (relativeFrameIndex < 0) {
-            throw new Error('Recorder received a frame that predates the current segment start.');
-          }
-
-          const frame = new VideoFrame(frameData, {
-            format: 'RGBA',
-            codedWidth: this.width,
-            codedHeight: this.height,
-            timestamp: this.getFrameTimestampUs(relativeFrameIndex),
-            duration: this.getFrameDurationUs(relativeFrameIndex)
-          });
-
-          try {
-            segment.encoder.encode(frame, {
-              keyFrame: relativeFrameIndex === 0 || (relativeFrameIndex % this.keyFrameInterval) === 0
-            });
-            segment.segmentSubmittedFrameCount += 1;
-            this.segmentSubmittedFrameCount = segment.segmentSubmittedFrameCount;
-          } finally {
-            frame.close();
-          }
-        },
-        pushFrame: function(rgbaPtr, byteLen, frameIndex) {
-          if (!this.recording || !this.currentSegment || !this.currentSegment.encoder) return;
-
-          const frameData = HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen);
-          if (this.rotating) {
-            this.pendingFrames.push({ frameIndex: frameIndex, frameData: frameData });
-            return;
-          }
-
-          try {
-            this.submitFrameToEncoder(frameData, frameIndex);
-          } catch (error) {
-            this.abortRecordingWithError('Recording failed while submitting a frame.', error);
-          }
-        },
-        logActionState: function(frameIndex, actionMask) {
-          if (!this.recording || !this.currentSegment) return;
-          const line = JSON.stringify({
-            type: 'action_state',
-            frame_index: frameIndex,
-            action_state: actionStateFromMask(actionMask),
-            ts_ms: Math.round(performance.now() - this.sessionStartMs)
-          });
-          if (this.rotating) {
-            this.pendingActions.push(line);
-            return;
-          }
-          this.currentSegment.actions.push(line);
-        },
-        buildCurrentPartData: function(segment, videoBuffer) {
-          const partBaseName = this.getPartBaseName(segment.partNumber);
-          const videoBlob = new Blob([videoBuffer], { type: 'video/webm' });
-          const jsonlText = segment.actions.length ? (segment.actions.join('\n') + '\n') : '';
-          const jsonlBlob = new Blob([jsonlText], { type: 'application/x-ndjson' });
-          return {
-            videoBlob: videoBlob,
-            jsonlBlob: jsonlBlob,
-            videoFilename: partBaseName + '.webm',
-            actionsFilename: partBaseName + '.actions.jsonl'
-          };
-        },
-        uploadCurrentPart: async function(segment, partData) {
-          const formData = new FormData();
-          formData.append('rom', this.romBaseName);
-          formData.append('session_uuid', this.sessionUuid);
-          formData.append('part_number', String(segment.partNumber));
-          formData.append('start_frame', String(segment.startFrame));
-          formData.append('fps', String(this.fps));
-          formData.append('video', partData.videoBlob, partData.videoFilename);
-          formData.append('actions', partData.jsonlBlob, partData.actionsFilename);
-
-          const response = await fetch(getUploadEndpointUrl(), {
-            method: 'POST',
-            credentials: 'same-origin',
-            body: formData
-          });
-
-          if (!response.ok) {
-            let bodyText = '';
-            try {
-              bodyText = await response.text();
-            } catch (error) {
-              bodyText = '';
-            }
-            throw new Error('Upload failed with status ' + response.status + (bodyText ? (': ' + bodyText) : ''));
-          }
-        },
-        downloadCurrentPart: function(partData) {
-          triggerDownload(partData.videoBlob, partData.videoFilename);
-          triggerDownload(partData.jsonlBlob, partData.actionsFilename);
-        },
-        persistCurrentPart: async function(segment, partData) {
-          try {
-            await this.uploadCurrentPart(segment, partData);
-            return { uploaded: true, fallbackDownload: false };
-          } catch (error) {
-            console.error('Segment upload failed; falling back to local download.', error);
-            this.downloadCurrentPart(partData);
-            setRecordingStatus('Upload failed for part ' + String(segment.partNumber).padStart(4, '0') + '; downloaded locally as fallback.');
-            return { uploaded: false, fallbackDownload: true };
-          }
-        },
-        closeCurrentEncoder: function() {
-          const segment = this.currentSegment;
-          if (!segment) {
-            this.encoder = null;
-            return;
-          }
-          if (segment.outputState) {
-            segment.outputState.acceptingOutput = false;
-          }
-          if (segment.encoder) {
-            try {
-              if (segment.encoder.state !== 'closed') {
-                segment.encoder.close();
-              }
-            } catch (error) {
-              console.error('Failed to close the active recorder encoder cleanly.', error);
-            }
-          }
-          segment.encoder = null;
-          segment.outputState = null;
-          this.encoder = null;
-        },
-        finalizeCurrentPartData: async function() {
-          const segment = this.currentSegment;
-          if (!segment || !segment.encoder || !segment.muxer || !segment.muxerTarget) {
-            throw new Error('Recorder state is incomplete for segment finalization.');
-          }
-          this.currentSegment = null;
-          this.encoder = null;
-
-          await segment.encoder.flush();
-          segment.muxer.finalize();
-          if (segment.outputState) {
-            segment.outputState.acceptingOutput = false;
-          }
-          segment.encoder.close();
-          segment.encoder = null;
-          segment.muxer = null;
-          segment.outputState = null;
-
-          if (!segment.muxerTarget.buffer) {
-            throw new Error('Recorder muxer did not produce a segment buffer.');
-          }
-          const partData = this.buildCurrentPartData(segment, segment.muxerTarget.buffer);
-          segment.muxerTarget = null;
-          return { segment: segment, partData: partData };
-        },
-        finalizeSessionCleanup: function(message) {
+        stop: function() {
+          if (!this.recording || !this.worker) return;
           this.recording = false;
-          this.rotating = false;
-          this.stopRequested = false;
+          this.worker.postMessage(null);
+          setRecordingStatus('Finalizing recording...');
+          setRecordingButtonsState(false, false);
+        },
+
+        pushFrame: function(rgbaPtr, byteLen, actionMask) {
+          if (!this.recording || !this.worker) return;
+          const u8 = HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen);
+          this.worker.postMessage(
+            { frameData: u8, actionMask: actionMask & 0xff },
+            [u8.buffer]
+          );
+        },
+
+        onWorkerMessage: function(msg) {
+          if (!msg || typeof msg !== 'object') return;
+          switch (msg.type) {
+            case 'recording_started':
+              this.recording = true;
+              isRecorderRunning = true;
+              setRecordingButtonsState(true, true);
+              setRecordingStatus('Recording...');
+              return;
+            case 'status':
+              setRecordingStatus(msg.message);
+              return;
+            case 'download_fallback':
+              triggerDownload(msg.videoBlob, msg.videoFilename);
+              triggerDownload(msg.jsonlBlob, msg.jsonlFilename);
+              return;
+            case 'recording_stopped':
+              this.recording = false;
+              isRecorderRunning = false;
+              this.worker = null;
+              setRecordingStatus(msg.message || 'Recording uploaded.');
+              setRecordingButtonsState(false, true);
+              return;
+            case 'error':
+              this.recording = false;
+              isRecorderRunning = false;
+              this.worker = null;
+              setRecordingStatus(msg.message || 'Recorder error.');
+              setRecordingButtonsState(false, true);
+              return;
+          }
+        },
+
+        onWorkerError: function(e) {
+          this.recording = false;
           isRecorderRunning = false;
-          this.closeCurrentEncoder();
-          this.currentSegment = null;
-          this.actions = [];
-          this.pendingFrames = [];
-          this.pendingActions = [];
-          setRecordingButtonsState(false, recorderRuntimeReady);
-          setRecordingStatus(message);
+          this.worker = null;
+          setRecordingStatus('Recorder worker failed: ' + (e && e.message || e));
+          setRecordingButtonsState(false, true);
         },
-        flushPendingToNewPart: function() {
-          const segment = this.currentSegment;
-          if (!segment) return;
-          while (this.pendingActions.length) {
-            segment.actions.push(this.pendingActions.shift());
-          }
-          while (this.pendingFrames.length) {
-            const pendingFrame = this.pendingFrames.shift();
-            this.submitFrameToEncoder(pendingFrame.frameData, pendingFrame.frameIndex);
-          }
-        },
-        finishCurrentPart: async function() {
-          const finalized = await this.finalizeCurrentPartData();
-          return this.persistCurrentPart(finalized.segment, finalized.partData);
-        },
-        rotateSegment: function(partNumber, startFrame) {
-          if (!this.recording || this.stopRequested || this.rotating) return;
-          this.rotating = true;
-          this.nextPartNumber = partNumber;
-          this.nextPartStartFrame = startFrame;
-          setRecordingStatus('Uploading segment ' + String(this.partNumber).padStart(4, '0') + '...');
-          this.finishCurrentPart().then((result) => {
-            if (this.stopRequested) {
-              this.rotating = false;
-              if (this.pendingFrames.length || this.pendingActions.length) {
-                const finalPartNumber = this.nextPartNumber;
-                const finalStartFrame = this.nextPartStartFrame;
-                this.stopRequested = false;
-                this.prepareSegmentBuffers(finalPartNumber, finalStartFrame);
-                this.startEncoderForCurrentPart();
-                this.flushPendingToNewPart();
-                setTimeout(() => {
-                  this.stopAndDownload();
-                }, 0);
-                return;
-              }
-              this.finalizeSessionCleanup(result && result.fallbackDownload ? 'Recording saved locally (upload fallback).' : 'Recording uploaded.');
-              return;
-            }
-
-            this.prepareSegmentBuffers(this.nextPartNumber, this.nextPartStartFrame);
-            this.startEncoderForCurrentPart();
-            this.flushPendingToNewPart();
-            this.rotating = false;
-            setRecordingButtonsState(true, recorderRuntimeReady);
-            setRecordingStatus('Recording Game Boy LCD part ' + String(this.partNumber).padStart(4, '0') + '...');
-          }).catch((error) => {
-            this.abortRecordingWithError('Recording failed while finalizing a segment.', error);
-          });
-        },
-        stopAndDownload: function() {
-          if (!this.recording) return;
-          if (this.rotating) {
-            this.stopRequested = true;
-            setRecordingStatus('Finalizing recording...');
-            return;
-          }
-
-          this.stopRequested = true;
-          setRecordingStatus('Uploading recording...');
-          this.finishCurrentPart().then((result) => {
-            if (this.pendingFrames.length || this.pendingActions.length) {
-              const finalPartNumber = this.nextPartNumber;
-              const finalStartFrame = this.nextPartStartFrame;
-              this.stopRequested = false;
-              this.prepareSegmentBuffers(finalPartNumber, finalStartFrame);
-              this.startEncoderForCurrentPart();
-              this.flushPendingToNewPart();
-              setTimeout(() => {
-                this.stopAndDownload();
-              }, 0);
-              return;
-            }
-            this.finalizeSessionCleanup(result && result.fallbackDownload ? 'Recording saved locally (upload fallback).' : 'Recording uploaded.');
-          }).catch((error) => {
-            this.abortRecordingWithError('Recording failed while finalizing the session.', error);
-          });
-        }
       };
 
-      function setRecordingEnabled(enabled) {
-        if (!recorderRuntimeReady) {
-          setRecordingStatus('Recorder not ready yet.');
-          return;
-        }
-        if (!Module) {
-          setRecordingStatus('Module not available.');
-          return;
-        }
-        let result = 0;
-        if (Module._se_set_gb_lcd_recording) {
-          result = Module._se_set_gb_lcd_recording(enabled ? 1 : 0);
-        } else if (Module.ccall) {
-          result = Module.ccall('se_set_gb_lcd_recording', 'number', ['number'], [enabled ? 1 : 0]);
-        } else {
-          setRecordingStatus('Recording bridge unavailable.');
-          return;
-        }
-
-        if (enabled && result === 0) {
-          setRecordingStatus('Load a Game Boy ROM before recording.');
-        } else if (!enabled && !isRecorderRunning) {
-          setRecordingButtonsState(false, recorderRuntimeReady);
-          setRecordingStatus('Recorder idle');
-        }
-      }
-
       startRecordingButton.addEventListener('click', function() {
-        setRecordingEnabled(true);
+        window.skyemuRecorder.start();
       });
       stopRecordingButton.addEventListener('click', function() {
-        setRecordingEnabled(false);
+        window.skyemuRecorder.stop();
       });
       setRecordingButtonsState(false, false);
       setRecordingStatus('Recorder loading...');
