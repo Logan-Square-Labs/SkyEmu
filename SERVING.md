@@ -73,3 +73,27 @@ TOKEN=mysecret ./serve.sh
 - **Token auth**: Every request must include `?token=<token>` in the URL. Requests without a valid token get a `403 Forbidden` response.
 - **HTTPS**: The server uses a self-signed TLS certificate (auto-generated at startup). Browsers will show a certificate warning on first visit — this is expected for self-signed certs.
 - **Log safety**: Tokens are redacted from server logs.
+
+## Quick Start (tmux)
+
+`./run.sh` opens a tmux session named `skyemu` with two panes:
+
+- **Top**: Docker server on port 8080, with `./recordings/` mounted into the container so uploaded recordings persist on the host
+- **Bottom**: Cloudflare tunnel (`cloudflared tunnel run skyemu`)
+
+```bash
+# Build the image first (if not already done)
+docker build -t skyemu-web .
+
+# Start both panes
+./run.sh
+
+# With a fixed token
+TOKEN=mysecret ./run.sh
+```
+
+If a `skyemu` tmux session already exists, the script attaches to it instead of creating a new one.
+
+## Cloudflare Tunnel
+
+**tunnel command:** ```bash cloudflared tunnel run skyemu```
