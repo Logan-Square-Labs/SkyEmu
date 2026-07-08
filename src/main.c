@@ -612,9 +612,9 @@ static void se_draw_lcd_in_rect(float lcd_render_x, float lcd_render_y, float lc
 
 #if defined(EMSCRIPTEN)
 EM_JS(void, se_js_recorder_push_frame,
-      (const uint8_t* rgba_ptr, int byte_len, int action_mask), {
+      (const uint8_t* frame_ptr, int byte_len, int action_mask), {
   if (window.skyemuRecorder && window.skyemuRecorder.pushFrame) {
-    window.skyemuRecorder.pushFrame(rgba_ptr, byte_len, action_mask);
+    window.skyemuRecorder.pushFrame(frame_ptr, byte_len, action_mask);
   }
 });
 
@@ -2283,7 +2283,7 @@ void gb_tile_map_debugger(){
             int color_id = sb_lookup_tile(gb,x,y,tile_map_base,bg_win_tile_data_mode);
             int p = (xt*10+(px)+1)+(yt*10+py+1)*image_width;
             int r=0,g=0,b=0;
-            sb_lookup_palette_color(gb,color_id,&r,&g,&b);
+            sb_lookup_palette_color(gb,color_id,&r,&g,&b,NULL);
             if(((x==(box_x1%256)||x==(box_x2%256)) && (((y-box_y1)&0xff)>=0 && ((box_y2-y)&0xff) <=box_y2-box_y1))||
                ((y==(box_y1%256)||y==(box_y2%256)) && (((x-box_x1)&0xff)>=0 && ((box_x2-x)&0xff) <=box_x2-box_x1))){
                r=255; g=b=0;
@@ -2763,8 +2763,8 @@ static void se_emulate_single_frame(){
     sb_tick(&emu_state,&core.gb, &scratch.gb);
 #if defined(EMSCRIPTEN)
     if(should_capture_gb_frame){
-      se_js_recorder_push_frame(core.gb.lcd.framebuffer,
-                                SB_LCD_W * SB_LCD_H * 4,
+      se_js_recorder_push_frame(scratch.gb.record_buffer,
+                                (SB_LCD_W * SB_LCD_H + 3) / 4,
                                 (int)se_gb_record_get_action_mask());
     }
 #endif
