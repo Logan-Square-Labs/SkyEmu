@@ -150,7 +150,6 @@
     <textarea class="emscripten" id="output" rows="8"></textarea>
     <hr>
     -->       
-    <script src="webm-muxer.js"></script>
     <script type='text/javascript'>    
       if ('serviceWorker' in navigator) {
           navigator.serviceWorker.register('sw.js').then(worker => {
@@ -259,9 +258,9 @@
           setRecordingButtonsState(false, false);
         },
 
-        pushFrame: function(rgbaPtr, byteLen, actionMask) {
+        pushFrame: function(framePtr, byteLen, actionMask) {
           if (!this.recording || !this.worker) return;
-          const u8 = HEAPU8.slice(rgbaPtr, rgbaPtr + byteLen);
+          const u8 = HEAPU8.slice(framePtr, framePtr + byteLen);
           this.worker.postMessage(
             { frameData: u8, actionMask: actionMask & 0xff },
             [u8.buffer]
@@ -281,7 +280,7 @@
               setRecordingStatus(msg.message);
               return;
             case 'download_fallback':
-              triggerDownload(msg.videoBlob, msg.videoFilename);
+              triggerDownload(msg.framesBlob, msg.framesFilename);
               triggerDownload(msg.jsonlBlob, msg.jsonlFilename);
               return;
             case 'recording_stopped':

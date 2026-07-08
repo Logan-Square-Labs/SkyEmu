@@ -474,9 +474,6 @@ if(NOT RETRO_CORE_ONLY)
                   ${CMAKE_CURRENT_SOURCE_DIR}/src/resources/icons/favicon_package
                   ${CMAKE_CURRENT_BINARY_DIR}/bin
           COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                  ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/webm-muxer.js
-                  ${CMAKE_CURRENT_BINARY_DIR}/bin/webm-muxer.js
-          COMMAND ${CMAKE_COMMAND} -E copy_if_different
                   ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/recorder-worker.js
                   ${CMAKE_CURRENT_BINARY_DIR}/bin/recorder-worker.js)
   endif()

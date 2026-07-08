@@ -323,6 +323,7 @@ typedef struct{
   unsigned int curr_scanline;
   unsigned int curr_window_scanline;
   uint8_t *framebuffer;
+  uint8_t *record_buffer;
   uint8_t vram[SB_VRAM_BANK_SIZE*SB_VRAM_NUM_BANKS];
   uint8_t color_palettes[SB_PPU_BG_COLOR_PALETTES+SB_PPU_SPRITE_COLOR_PALETTES];
   bool in_hblank; //Used for HDMA
@@ -433,6 +434,7 @@ typedef struct {
 
 typedef struct{
   uint8_t framebuffer[SB_LCD_H*SB_LCD_W*4];
+  uint8_t record_buffer[(SB_LCD_H*SB_LCD_W+3)/4];
   uint8_t bios[2304];
  } gb_scratch_t; 
 
@@ -494,7 +496,7 @@ typedef void (*sb_opcode_impl_t)(sb_gb_t*,int op1,int op2, int op1_enum, int op2
 #include "sb_instr_tables.h"
 
 uint32_t sb_lookup_tile(sb_gb_t* gb, int px, int py, int tile_base, int data_mode);
-void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b);
+void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b, uint8_t *shade_out);
 static FORCE_INLINE void sb_process_audio(sb_gb_t *gb, sb_emu_state_t*emu, double delta_time,int cycles);
 static void sb_tick_frame_seq(sb_gb_t*gb,sb_frame_sequencer_t* seq);
 static void sb_process_audio_writes(sb_gb_t* gb); 
@@ -1033,7 +1035,7 @@ uint32_t sb_lookup_tile(sb_gb_t* gb, int px, int py, int tile_base, int data_mod
   if(bg_to_oam_priority)color_id|= 1<<8;
   return color_id;
 }
-void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b){
+void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b, uint8_t *shade_out){
   uint8_t palette = 0;
   if(gb->model == SB_GB){
     int pal_id = SB_BFE(color_id,2,6);
@@ -1041,6 +1043,7 @@ void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b){
     else if(pal_id==SB_OBJ1_PALETTE)palette = sb_read8_io(gb, SB_IO_PPU_OBP1);
     else palette = color_id ==0 ? 0 : sb_read8_io(gb, SB_IO_PPU_OBP0);
     color_id = SB_BFE(palette,2*(color_id&0x3),2);
+    if(shade_out)*shade_out = (uint8_t)color_id;
 
     *r = gb->dmg_palette[color_id*3+0];
     *g = gb->dmg_palette[color_id*3+1];
@@ -1056,6 +1059,9 @@ void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b){
       else pal_map = color_id ==0 ? 0 : sb_read8_io(gb, SB_IO_PPU_OBP0);
       color_id = SB_BFE(pal_map,2*(color_id&0x3),2);
       palette=pal_id==SB_BACKG_PALETTE?0:8;
+      if(shade_out)*shade_out = (uint8_t)color_id;
+    }else if(shade_out){
+      *shade_out = (uint8_t)(color_id & 0x3);
     }
 
     int entry= palette*8+(color_id&0x3)*2;
@@ -1070,6 +1076,13 @@ void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b){
     *g = tg*8;
     *b = tb*8;
   }
+}
+
+static FORCE_INLINE void sb_record_pixel_2bit(uint8_t *record_buffer, int x, int y, uint8_t shade){
+  int idx = y * SB_LCD_W + x;
+  int byte_idx = idx >> 2;
+  int shift = 6 - ((idx & 3) << 1);
+  record_buffer[byte_idx] = (uint8_t)((record_buffer[byte_idx] & ~(3u << shift)) | ((shade & 3u) << shift));
 }
 void sb_draw_pixel(sb_emu_state_t*emu,sb_gb_t* gb, int x, int y){
   uint8_t ctrl = sb_read8_io(gb, SB_IO_LCD_CTRL);
@@ -1159,7 +1172,11 @@ void sb_draw_pixel(sb_emu_state_t*emu,sb_gb_t* gb, int x, int y){
     }
   }
   int r=0,g=0,b=0;
-  sb_lookup_palette_color(gb,color_id,&r,&g,&b);
+  uint8_t shade = 0;
+  sb_lookup_palette_color(gb,color_id,&r,&g,&b,&shade);
+  if(gb->lcd.record_buffer){
+    sb_record_pixel_2bit(gb->lcd.record_buffer, x, y, shade);
+  }
 
   float ghost_coef = 0.5;
   if(gb->model != SB_GB)ghost_coef= 0.2;
@@ -1338,6 +1355,7 @@ void gb_tick_rtc(sb_gb_t*gb){
 
 void sb_ptrs_init(sb_gb_t* gb, gb_scratch_t* scratch, uint8_t* rom_data) {
   gb->lcd.framebuffer = scratch->framebuffer; 
+  gb->lcd.record_buffer = scratch->record_buffer;
   gb->cart.data = rom_data; 
   gb->bios = scratch->bios;
 }
@@ -1352,6 +1370,9 @@ void sb_tick(sb_emu_state_t* emu, sb_gb_t* gb,gb_scratch_t* scratch){
   int rumble_cycles= 0; 
   gb->lcd.finished_frame =false;
   gb->lcd.render_frame = emu->render_frame;
+  if(emu->render_frame){
+    memset(scratch->record_buffer, 0, sizeof(scratch->record_buffer));
+  }
   gb_tick_rtc(gb);
   for(int i=0;i<instructions_to_execute;++i){
     bool double_speed = false;

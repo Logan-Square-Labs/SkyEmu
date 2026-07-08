@@ -124,8 +124,8 @@ class TokenAuthHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "Missing required fields", "missing": missing_fields}, from_token=from_token)
             return
 
-        if "video" not in form or "actions" not in form:
-            self._send_json(400, {"ok": False, "error": "Missing required file fields: video and actions"}, from_token=from_token)
+        if "frames" not in form or "actions" not in form:
+            self._send_json(400, {"ok": False, "error": "Missing required file fields: frames and actions"}, from_token=from_token)
             return
 
         try:
@@ -138,11 +138,16 @@ class TokenAuthHandler(http.server.SimpleHTTPRequestHandler):
         session_uuid = self._sanitize_name(form.getvalue("session_uuid"), "session")
         part_number = f"{part_number_int:04d}"
         base_name = f"{rom}.{session_uuid}.{part_number}"
-        video_path = os.path.join(self.recordings_dir, base_name + ".webm")
+        frames_field = form["frames"]
+        frames_filename = getattr(frames_field, "filename", None) or (base_name + ".frames.bin.gz")
+        if frames_filename.endswith(".gz"):
+            frames_path = os.path.join(self.recordings_dir, base_name + ".frames.bin.gz")
+        else:
+            frames_path = os.path.join(self.recordings_dir, base_name + ".frames.bin")
         actions_path = os.path.join(self.recordings_dir, base_name + ".actions.jsonl")
 
         try:
-            self._write_uploaded_file(form["video"], video_path)
+            self._write_uploaded_file(frames_field, frames_path)
             self._write_uploaded_file(form["actions"], actions_path)
         except Exception as exc:
             self._send_json(500, {"ok": False, "error": "Failed to store upload", "detail": str(exc)}, from_token=from_token)
@@ -151,7 +156,7 @@ class TokenAuthHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, {
             "ok": True,
             "stored": [
-                os.path.basename(video_path),
+                os.path.basename(frames_path),
                 os.path.basename(actions_path),
             ],
         }, from_token=from_token)
