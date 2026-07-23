@@ -1081,7 +1081,7 @@ void sb_lookup_palette_color(sb_gb_t*gb,int color_id, int*r, int *g, int *b, uin
 static FORCE_INLINE void sb_record_pixel_2bit(uint8_t *record_buffer, int x, int y, uint8_t shade){
   int idx = y * SB_LCD_W + x;
   int byte_idx = idx >> 2;
-  int shift = 6 - ((idx & 3) << 1);
+  int shift = (idx & 3) << 1;
   record_buffer[byte_idx] = (uint8_t)((record_buffer[byte_idx] & ~(3u << shift)) | ((shade & 3u) << shift));
 }
 void sb_draw_pixel(sb_emu_state_t*emu,sb_gb_t* gb, int x, int y){
