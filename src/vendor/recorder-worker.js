@@ -91,7 +91,7 @@ function appendSegmentMeta(session) {
     pixel_format: 'gb_2bit_packed',
     bits_per_pixel: 2,
     bytes_per_frame: BYTES_PER_FRAME,
-    packing: '4_pixels_per_uint8_msb_first_row_major',
+    packing: '4_pixels_per_uint8_lsb_first_row_major',
     compression: session.compression,
   }));
 }

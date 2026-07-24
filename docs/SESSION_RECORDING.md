@@ -96,9 +96,9 @@ Open design question: should a failed mid-session upload abort recording, retry,
 - **Resolution:** 160×144 (DMG/CGB LCD).
 - **Pixel meaning:** post-palette **shade index** `0..3`, not RGB.
 - **Timing in the pipeline:** written in `sb_draw_pixel` **after** palette lookup and **before** screen ghosting is applied to the RGBA framebuffer.
-- **Packing:** 4 pixels per `uint8`, MSB-first, row-major.
+- **Packing:** 4 pixels per `uint8`, LSB-first, row-major.
   - Byte size: `(160*144 + 3) >> 2` = **5760**.
-  - Pixel `i` → byte `i>>2`, shift `6 - ((i&3)<<1)`.
+  - Pixel `i` → byte `i>>2`, shift `(i&3)<<1`.
 - **When pushed:** only when `emu_state.render_frame` is true (skipped frames are not recorded — intentional for “frame-exact” rendered output, not every emulated tick when frames are dropped for perf).
 
 ### Action mask
@@ -154,7 +154,7 @@ Auth: same-origin cookie/`?token=` as the rest of `serve_auth.py`.
   "pixel_format": "gb_2bit_packed",
   "bits_per_pixel": 2,
   "bytes_per_frame": 5760,
-  "packing": "4_pixels_per_uint8_msb_first_row_major",
+  "packing": "4_pixels_per_uint8_lsb_first_row_major",
   "compression": "gzip"
 }
 ```
