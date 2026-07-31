@@ -8,14 +8,40 @@ This interface provides access to the following functionality:
 - Reading/Writing arbitrary memory addresses in the emulated system
 - Stepping the emulator a controlled number of frames
 - Controlling user inputs for the emulator and emulated console
+- Combined Game Boy agent steps that apply an action mask and return packed 2-bit LCD frames
 
 To enable the server check the "Enable HTTP Control Server" option in the advanced settings and configure the port. 
 
-Additionally, SkyEmu can be launched in a mode optimized for headless display using the following commandline parameters:
+Additionally, SkyEmu can be launched in a mode optimized for headless automation using the following commandline parameters:
 
 ``` ./SkyEmu http_server <Server Port> <Path To ROM file> ```
 
-When running using these parameters, SkyEmu won't render the UI and will run without sleeping to synchronize with real time. 
+When running using these parameters, SkyEmu won't render the UI, skips real-time sleep, starts paused, and serves the HTTP Control Server on the given port. The ROM path must be a **local filesystem path** that this SkyEmu process can open. Cloud object storage (for example a Cloudflare R2 bucket) is not read directly—download or sync the `.gb` / `.gbc` file to disk first, then pass that local path.
+
+## Game Boy agent workflow
+
+Typical observe/act loop for a GB agent that consumes packed 2-bit LCD frames:
+
+1. Place the ROM on local disk (download from R2/S3/etc. if needed).
+2. Start headless SkyEmu:
+
+``` ./SkyEmu http_server 8080 /path/to/game.gb ```
+
+3. Confirm the server and ROM:
+
+```http://localhost:8080/ping``` → `pong`
+
+```http://localhost:8080/status``` → JSON with `"rom-loaded": true` and the ROM path
+
+4. Drive the game with `/agent_step` (preferred over separate `/input` + `/step` + `/screen` calls):
+
+```http://localhost:8080/agent_step?action=32&frames=1```
+
+`action` is a decimal bitmask (here `32` = Right). The response body is exactly **5760** bytes (`application/octet-stream`).
+
+5. Repeat: choose the next `action` from the returned frame, call `/agent_step` again.
+
+Inputs set by `/agent_step` remain latched until a later call replaces the 8 GB buttons (same latching model as `/input`). Use `action=0` to release all GB buttons. See `tools/agent-step-example.py` for a minimal client.
 
 # Overview of API commands
 
@@ -24,7 +50,7 @@ A description of each of the supported API commands is shown below. You can test
 ```http://localhost:<port>/cmd?Param=Value```
 
 # /ping command
-Returns the word 'pong' used to check if the server is up. 
+Returns the word 'pong' used to check if the server is up. Text responses from the HTTP Control Server are C strings and may include a trailing NUL byte in the HTTP body; strip it when comparing in clients.
 
 **Example:**
 
@@ -72,6 +98,44 @@ The emulator is un-paused and runs at 1x speed. Returns "ok" on completion.
 The emulator is playing at 1x speed. 
 
 ```ok```
+
+# /agent_step command
+
+Applies a Game Boy action mask, steps the emulator forward one or more frames, and returns the resulting LCD frame as packed 2-bit shade data. This is intended for low-latency game-playing agents that observe raw LCD shades and emit button masks.
+
+Only Game Boy / Game Boy Color ROMs are supported. Returns an error string if no ROM is loaded or a non-GB system is active.
+
+**Parameters:**
+
+- `action` (optional, default `0`): decimal bitmask `0`–`255` for the 8 Game Boy buttons. Bits are LSB→MSB: `A`, `B`, `Up`, `Down`, `Left`, `Right`, `Start`, `Select`. The mask **replaces** those eight button states for subsequent steps; other HTTP Control Server inputs are left unchanged. Omitting `action` releases all eight Game Boy buttons.
+- `frames` (optional, default `1`): number of frames to advance. Values less than `1` are clamped to `1`.
+
+**Response:**
+
+On success, the body is exactly **5760** raw bytes with `Content-Type: application/octet-stream`. The packing matches the `gb_2bit_packed` format described in [SESSION_RECORDING.md](SESSION_RECORDING.md):
+
+- Resolution: 160×144
+- Pixel meaning: post-palette shade index `0`–`3` (not RGB)
+- Timing: captured after palette lookup and before screen ghosting
+- Packing: 4 pixels per byte, LSB-first, row-major
+
+**Example:**
+
+```http://localhost:8080/agent_step?action=1&frames=1```
+
+**Result:**
+
+Presses `A`, steps one frame, and returns 5760 bytes of packed LCD data.
+
+**Example (release all buttons and step):**
+
+```http://localhost:8080/agent_step```
+
+**Result:**
+
+All eight Game Boy buttons are released, the emulator steps one frame, and 5760 bytes of packed LCD data are returned.
+
+See also `tools/agent-step-example.py` for a minimal client loop.
 
 # /screen command
 
