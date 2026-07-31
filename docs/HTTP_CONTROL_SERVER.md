@@ -8,6 +8,7 @@ This interface provides access to the following functionality:
 - Reading/Writing arbitrary memory addresses in the emulated system
 - Stepping the emulator a controlled number of frames
 - Controlling user inputs for the emulator and emulated console
+- Combined Game Boy agent steps that apply an action mask and return packed 2-bit LCD frames
 
 To enable the server check the "Enable HTTP Control Server" option in the advanced settings and configure the port. 
 
@@ -72,6 +73,44 @@ The emulator is un-paused and runs at 1x speed. Returns "ok" on completion.
 The emulator is playing at 1x speed. 
 
 ```ok```
+
+# /agent_step command
+
+Applies a Game Boy action mask, steps the emulator forward one or more frames, and returns the resulting LCD frame as packed 2-bit shade data. This is intended for low-latency game-playing agents that observe raw LCD shades and emit button masks.
+
+Only Game Boy / Game Boy Color ROMs are supported. Returns an error string if no ROM is loaded or a non-GB system is active.
+
+**Parameters:**
+
+- `action` (optional, default `0`): decimal bitmask `0`–`255` for the 8 Game Boy buttons. Bits are LSB→MSB: `A`, `B`, `Up`, `Down`, `Left`, `Right`, `Start`, `Select`. The mask **replaces** those eight button states for subsequent steps; other HTTP Control Server inputs are left unchanged. Omitting `action` releases all eight Game Boy buttons.
+- `frames` (optional, default `1`): number of frames to advance. Values less than `1` are clamped to `1`.
+
+**Response:**
+
+On success, the body is exactly **5760** raw bytes with `Content-Type: application/octet-stream`. The packing matches the `gb_2bit_packed` format described in [SESSION_RECORDING.md](SESSION_RECORDING.md):
+
+- Resolution: 160×144
+- Pixel meaning: post-palette shade index `0`–`3` (not RGB)
+- Timing: captured after palette lookup and before screen ghosting
+- Packing: 4 pixels per byte, LSB-first, row-major
+
+**Example:**
+
+```http://localhost:8080/agent_step?action=1&frames=1```
+
+**Result:**
+
+Presses `A`, steps one frame, and returns 5760 bytes of packed LCD data.
+
+**Example (release all buttons and step):**
+
+```http://localhost:8080/agent_step```
+
+**Result:**
+
+All eight Game Boy buttons are released, the emulator steps one frame, and 5760 bytes of packed LCD data are returned.
+
+See also `tools/agent-step-example.py` for a minimal client loop.
 
 # /screen command
 

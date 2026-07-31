@@ -610,20 +610,6 @@ static int se_draw_theme_region_tint_partial(int region, float x, float y, float
 static void se_compute_draw_lcd_rect(float *lcd_render_w, float *lcd_render_h, int* nds_layout);
 static void se_draw_lcd_in_rect(float lcd_render_x, float lcd_render_y, float lcd_render_w, float lcd_render_h, int nds_layout);
 
-#if defined(EMSCRIPTEN)
-EM_JS(void, se_js_recorder_push_frame,
-      (const uint8_t* frame_ptr, int byte_len, int action_mask), {
-  if (window.skyemuRecorder && window.skyemuRecorder.pushFrame) {
-    window.skyemuRecorder.pushFrame(frame_ptr, byte_len, action_mask);
-  }
-});
-
-EM_JS(void, se_js_recorder_set_rom_name, (const char* rom_name), {
-  if (window.skyemuRecorder && window.skyemuRecorder.setRomName) {
-    window.skyemuRecorder.setRomName(UTF8ToString(rom_name));
-  }
-});
-
 static const int se_gb_record_action_keys[] = {
   SE_KEY_A, SE_KEY_B, SE_KEY_UP, SE_KEY_DOWN,
   SE_KEY_LEFT, SE_KEY_RIGHT, SE_KEY_START, SE_KEY_SELECT
@@ -638,6 +624,28 @@ static uint8_t se_gb_record_get_action_mask(void){
   }
   return mask;
 }
+
+#ifdef ENABLE_HTTP_CONTROL_SERVER
+static void se_gb_record_set_action_mask(uint8_t mask){
+  for(size_t i=0;i<sizeof(se_gb_record_action_keys)/sizeof(se_gb_record_action_keys[0]);++i){
+    gui_state.hcs_joypad.inputs[se_gb_record_action_keys[i]] = (mask & (1u<<i)) ? 1.0f : 0.0f;
+  }
+}
+#endif
+
+#if defined(EMSCRIPTEN)
+EM_JS(void, se_js_recorder_push_frame,
+      (const uint8_t* frame_ptr, int byte_len, int action_mask), {
+  if (window.skyemuRecorder && window.skyemuRecorder.pushFrame) {
+    window.skyemuRecorder.pushFrame(frame_ptr, byte_len, action_mask);
+  }
+});
+
+EM_JS(void, se_js_recorder_set_rom_name, (const char* rom_name), {
+  if (window.skyemuRecorder && window.skyemuRecorder.setRomName) {
+    window.skyemuRecorder.setRomName(UTF8ToString(rom_name));
+  }
+});
 #endif
 
 const char* se_get_pref_path(){
@@ -6746,6 +6754,37 @@ uint8_t* se_hcs_callback(const char* cmd, const char** params, uint64_t* result_
     se_update_frame(); 
     emu_state.step_frames=old_step;
     str_result="ok";
+  }else if(strcmp(cmd,"/agent_step")==0){
+    if(!emu_state.rom_loaded){
+      str_result="Failed (no ROM loaded)";
+    }else if(emu_state.system!=SYSTEM_GB){
+      str_result="Failed (Game Boy ROM required)";
+    }else{
+      int action = 0;
+      int step_frames = 1;
+      int old_step = emu_state.step_frames;
+      while(*params){
+        if(strcmp(params[0],"action")==0)action=atoi(params[1]);
+        else if(strcmp(params[0],"frames")==0)step_frames=atoi(params[1]);
+        params+=2;
+      }
+      if(step_frames<1)step_frames=1;
+      se_gb_record_set_action_mask((uint8_t)action);
+      emu_state.step_frames=step_frames;
+      emu_state.run_mode = SB_MODE_STEP;
+      se_update_frame();
+      emu_state.step_frames=old_step;
+      const size_t frame_bytes = (SB_LCD_W * SB_LCD_H + 3) / 4;
+      uint8_t* result = (uint8_t*)malloc(frame_bytes);
+      if(!result){
+        str_result="Failed (out of memory)";
+      }else{
+        memcpy(result, scratch.gb.record_buffer, frame_bytes);
+        *result_size = frame_bytes;
+        *mime_type = "application/octet-stream";
+        return result;
+      }
+    }
   }else if(strcmp(cmd,"/run")==0){
     emu_state.step_frames=1;
     emu_state.run_mode = SB_MODE_RUN;
