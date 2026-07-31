@@ -12,11 +12,36 @@ This interface provides access to the following functionality:
 
 To enable the server check the "Enable HTTP Control Server" option in the advanced settings and configure the port. 
 
-Additionally, SkyEmu can be launched in a mode optimized for headless display using the following commandline parameters:
+Additionally, SkyEmu can be launched in a mode optimized for headless automation using the following commandline parameters:
 
 ``` ./SkyEmu http_server <Server Port> <Path To ROM file> ```
 
-When running using these parameters, SkyEmu won't render the UI and will run without sleeping to synchronize with real time. 
+When running using these parameters, SkyEmu won't render the UI, skips real-time sleep, starts paused, and serves the HTTP Control Server on the given port. The ROM path must be a **local filesystem path** that this SkyEmu process can open. Cloud object storage (for example a Cloudflare R2 bucket) is not read directly—download or sync the `.gb` / `.gbc` file to disk first, then pass that local path.
+
+## Game Boy agent workflow
+
+Typical observe/act loop for a GB agent that consumes packed 2-bit LCD frames:
+
+1. Place the ROM on local disk (download from R2/S3/etc. if needed).
+2. Start headless SkyEmu:
+
+``` ./SkyEmu http_server 8080 /path/to/game.gb ```
+
+3. Confirm the server and ROM:
+
+```http://localhost:8080/ping``` → `pong`
+
+```http://localhost:8080/status``` → JSON with `"rom-loaded": true` and the ROM path
+
+4. Drive the game with `/agent_step` (preferred over separate `/input` + `/step` + `/screen` calls):
+
+```http://localhost:8080/agent_step?action=32&frames=1```
+
+`action` is a decimal bitmask (here `32` = Right). The response body is exactly **5760** bytes (`application/octet-stream`).
+
+5. Repeat: choose the next `action` from the returned frame, call `/agent_step` again.
+
+Inputs set by `/agent_step` remain latched until a later call replaces the 8 GB buttons (same latching model as `/input`). Use `action=0` to release all GB buttons. See `tools/agent-step-example.py` for a minimal client.
 
 # Overview of API commands
 
@@ -25,7 +50,7 @@ A description of each of the supported API commands is shown below. You can test
 ```http://localhost:<port>/cmd?Param=Value```
 
 # /ping command
-Returns the word 'pong' used to check if the server is up. 
+Returns the word 'pong' used to check if the server is up. Text responses from the HTTP Control Server are C strings and may include a trailing NUL byte in the HTTP body; strip it when comparing in clients.
 
 **Example:**
 

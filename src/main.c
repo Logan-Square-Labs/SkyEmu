@@ -8665,27 +8665,30 @@ static bool se_load_theme_from_image(uint8_t* im, uint32_t im_w, uint32_t im_h, 
           }
         }
       }
-      sg_image_data im_data={0};
-      im_data.subimage[0][0].ptr =data;
-      im_data.subimage[0][0].size =mip_h*mip_w*4;
-      sg_image_desc desc={
-        .type=              SG_IMAGETYPE_2D,
-        .render_target=     false,
-        .width=             mip_w,
-        .height=            mip_h,
-        .num_slices=        1,
-        .num_mipmaps=       0,
-        .usage=             SG_USAGE_IMMUTABLE,
-        .pixel_format=      SG_PIXELFORMAT_RGBA8,
-        .sample_count=      1,
-        .min_filter=        SG_FILTER_LINEAR,
-        .mag_filter=        SG_FILTER_LINEAR,
-        .wrap_u=            SG_WRAP_CLAMP_TO_EDGE,
-        .wrap_v=            SG_WRAP_CLAMP_TO_EDGE,
-        .border_color=      SG_BORDERCOLOR_OPAQUE_BLACK,
-        .data=              im_data,
-      };
-      gui_state.theme.image[m]=  sg_make_image(&desc);
+      // http_server/headless mode never calls sg_setup(); skip GPU upload there.
+      if(sg_isvalid()){
+        sg_image_data im_data={0};
+        im_data.subimage[0][0].ptr =data;
+        im_data.subimage[0][0].size =mip_h*mip_w*4;
+        sg_image_desc desc={
+          .type=              SG_IMAGETYPE_2D,
+          .render_target=     false,
+          .width=             mip_w,
+          .height=            mip_h,
+          .num_slices=        1,
+          .num_mipmaps=       0,
+          .usage=             SG_USAGE_IMMUTABLE,
+          .pixel_format=      SG_PIXELFORMAT_RGBA8,
+          .sample_count=      1,
+          .min_filter=        SG_FILTER_LINEAR,
+          .mag_filter=        SG_FILTER_LINEAR,
+          .wrap_u=            SG_WRAP_CLAMP_TO_EDGE,
+          .wrap_v=            SG_WRAP_CLAMP_TO_EDGE,
+          .border_color=      SG_BORDERCOLOR_OPAQUE_BLACK,
+          .data=              im_data,
+        };
+        gui_state.theme.image[m]=  sg_make_image(&desc);
+      }
       if(m>1)free((uint8_t*)data2);
       data2=data;
     }
